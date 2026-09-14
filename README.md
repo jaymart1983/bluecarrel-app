@@ -1,8 +1,13 @@
-# X4 Pro Sync
+# Bluecarrel
 
-Android companion app for the **Xteink X4 Pro** running the CrossPoint X4 Pro
-firmware. It keeps the reader's library, reading positions and firmware in sync
-with your own Calibre-Web Automated server, over Bluetooth.
+Android companion app that links e-readers to your own ebook library over
+Bluetooth. It keeps the reader's library, reading positions and firmware in sync
+with your own server.
+
+Currently supports the **Xteink X4 Pro** running
+[Bluecarrel firmware](https://github.com/jaymart1983/bluecarrel-firmware), with a
+[Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
+server as the library.
 
 No DRM handling, no Xteink cloud. The app talks to your server and your reader,
 nothing else.
@@ -37,16 +42,18 @@ nothing else.
 ## Requirements
 
 - Android 10 (API 29) or later with Bluetooth LE.
-- An Xteink X4 Pro running the CrossPoint X4 Pro firmware
-  ([`ble-x4pro` branch](https://github.com/jaymart1983/crosspoint-reader/tree/ble-x4pro)).
+- An Xteink X4 Pro running
+  [Bluecarrel firmware](https://github.com/jaymart1983/bluecarrel-firmware).
 - A [Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
   server with OPDS and kosync enabled, reachable from the phone over **HTTPS**.
   Plain `http://` is refused, including on a LAN or VPN.
 
 ## Setup
 
-1. Install the APK and open the app. Allow Bluetooth and notifications, and allow
-   background use when asked (needed for sync with the app closed).
+1. Install the APK from the
+   [releases page](https://github.com/jaymart1983/bluecarrel-app/releases) and
+   open the app. Allow Bluetooth and notifications, and allow background use
+   when asked (needed for sync with the app closed).
 2. **Settings:** enter the server URL (must start with `https://`, for example
    `https://books.example.com`) and your Calibre-Web account. The OPDS
    catalogue and kosync both use it. The account is sent only to that server.
@@ -54,11 +61,10 @@ nothing else.
    **Settings**. In the app, tap **Pair** and enter the passkey the reader shows
    in Android's pairing dialog.
 4. Optional: set an **update page** (see below). Blank uses
-   `https://github.com/jaymart1983/crosspoint-reader/releases/latest/download/`.
+   `https://github.com/jaymart1983/bluecarrel-firmware/releases/latest/download/`.
 
 To pair again: **Forget pairing** in the app, remove the reader in Android's
-Bluetooth settings, then pair as above. Pairings from app 9.x (six-digit code)
-do not carry over.
+Bluetooth settings, then pair as above.
 
 If the app stops connecting after an update of the app itself, turn the phone's
 Bluetooth off and on.
@@ -66,12 +72,13 @@ Bluetooth off and on.
 ## Hosting firmware updates
 
 The update page is any static HTTPS server (GitHub release downloads work). Put
-the firmware image next to a `firmware.json`:
+the firmware image, named `bluecarrel-x4pro-<version>.bin`, next to a
+`firmware.json`:
 
 ```json
 {
   "version": "20260914.0032",
-  "file": "crosspoint-x4pro-20260914.0032.bin",
+  "file": "bluecarrel-x4pro-20260914.0032.bin",
   "size": 4661136,
   "sha256": "6f2647312e9b52fdfddd029b905472e5936b15f64742ae8a902497d1eeb764b3",
   "signature": "3045022100…"

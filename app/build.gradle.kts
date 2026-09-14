@@ -19,18 +19,18 @@ plugins {
 }
 
 android {
-    namespace = "com.jmart.x4sync"
+    namespace = "dev.bluecarrel.app"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.jmart.x4sync"
+        applicationId = "dev.bluecarrel.app"
         minSdk = 29
         targetSdk = 34
         // Bump BOTH on every published build. Android only offers an APK as an
         // update when versionCode increases, and Diagnostics shows versionName so
         // the running build can be identified from the phone.
-        versionCode = 128
-        versionName = "10.0.0"
+        versionCode = 1
+        versionName = "1.0.0"
     }
 
     signingConfigs {
