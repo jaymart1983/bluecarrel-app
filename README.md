@@ -9,9 +9,10 @@ nothing else.
 
 ## What it does
 
-- **Bluetooth link.** Pair once with the code shown on the reader. After that the
-  phone is a trusted host and reconnects on its own. The reader shows the phone's
-  name.
+- **Bluetooth link.** Pair once with the passkey shown on the reader. The link is
+  bonded and encrypted, and the app and reader prove a shared secret to each
+  other on every connect. After pairing the app connects only to that reader.
+  The reader shows the phone's name.
 - **Library.** Browse and search your Calibre-Web Automated catalogue (OPDS).
   Books you mark offline are downloaded to the phone and mirrored to the reader.
   Removing one removes it from both. If the book is open on the reader, the app
@@ -28,9 +29,10 @@ nothing else.
 - **Store on the reader.** The reader can browse the catalogue itself; the phone
   answers its requests over Bluetooth.
 - **Firmware updates.** The app checks an update page for a newer reader build,
-  downloads it, checks its SHA-256 and sends it to the reader. The reader asks
-  **Update now / Later / Cancel**; Later installs the next time it sleeps.
-  Automatic download can be switched on in Reader settings.
+  downloads it, checks its SHA-256 and sends it with its signature. The reader
+  installs only signed, newer builds and asks **Update now / Later / Cancel**;
+  Later installs the next time it sleeps. Automatic download can be switched on
+  in Reader settings.
 
 ## Requirements
 
@@ -38,40 +40,52 @@ nothing else.
 - An Xteink X4 Pro running the CrossPoint X4 Pro firmware
   ([`ble-x4pro` branch](https://github.com/jaymart1983/crosspoint-reader/tree/ble-x4pro)).
 - A [Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
-  server with OPDS and kosync enabled, reachable from the phone (LAN, VPN or a
-  tunnel).
+  server with OPDS and kosync enabled, reachable from the phone over **HTTPS**.
+  Plain `http://` is refused, including on a LAN or VPN.
 
 ## Setup
 
 1. Install the APK and open the app. Allow Bluetooth and notifications, and allow
    background use when asked (needed for sync with the app closed).
-2. **Settings:** enter the server URL (for example `https://books.example.com`)
-   and your Calibre-Web account. The OPDS catalogue and kosync both use it.
+2. **Settings:** enter the server URL (must start with `https://`, for example
+   `https://books.example.com`) and your Calibre-Web account. The OPDS
+   catalogue and kosync both use it. The account is sent only to that server.
 3. On the reader, tap the Power button to open the Control Centre and tap
-   **Settings**. Enter the pairing code it shows into the app.
-4. Optional: set an **update page** URL to receive firmware updates (see below).
+   **Settings**. In the app, tap **Pair** and enter the passkey the reader shows
+   in Android's pairing dialog.
+4. Optional: set an **update page** (see below). Blank uses
+   `https://github.com/jaymart1983/crosspoint-reader/releases/latest/download/`.
+
+To pair again: **Forget pairing** in the app, remove the reader in Android's
+Bluetooth settings, then pair as above. Pairings from app 9.x (six-digit code)
+do not carry over.
 
 If the app stops connecting after an update of the app itself, turn the phone's
 Bluetooth off and on.
 
 ## Hosting firmware updates
 
-The update page is any static web server. Put the firmware image next to a
-`firmware.json`:
+The update page is any static HTTPS server (GitHub release downloads work). Put
+the firmware image next to a `firmware.json`:
 
 ```json
 {
   "version": "20260914.0032",
   "file": "crosspoint-x4pro-20260914.0032.bin",
   "size": 4661136,
-  "sha256": "6f2647312e9b52fdfddd029b905472e5936b15f64742ae8a902497d1eeb764b3"
+  "sha256": "6f2647312e9b52fdfddd029b905472e5936b15f64742ae8a902497d1eeb764b3",
+  "signature": "3045022100…"
 }
 ```
 
 `version` is the firmware's build stamp (`yyyyMMdd.HHmm`). The app compares it
 with the version the reader reports and offers the update when the page is
 newer. `size` and `sha256` must describe `file` exactly; the app refuses an image
-that does not match.
+that does not match or is over 8 MB. `signature` is the DER ECDSA P-256
+signature, in lowercase hex, over `X4FW1|<version>|<sha256>`, made with the
+firmware signing key (`scripts/make_firmware_json.sh` in the firmware repo
+writes it). The app refuses a manifest without one, and the reader refuses an
+image whose signature does not verify.
 
 ## Build
 

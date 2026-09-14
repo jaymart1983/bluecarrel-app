@@ -31,7 +31,7 @@ data class Config(
      * Where new builds of this app and of the reader firmware are published:
      * the page that holds `firmware.json`.
      *
-     * Blank means no update checks -- see [effectiveUpdatesUrl]. Stored
+     * Blank means [DEFAULT_UPDATES_URL] -- see [effectiveUpdatesUrl]. Stored
      * separately from [serverUrl] because the download page is a different
      * service from Calibre and need not live on the same host.
      */
@@ -39,12 +39,31 @@ data class Config(
     /** Send a newer reader build in the background as soon as one is seen. */
     val autoDownloadFirmware: Boolean = false,
 ) {
-    /** [updatesUrl], trimmed. Blank when no update page is set. */
+    /**
+     * The update page in use: [updatesUrl] trimmed, [DEFAULT_UPDATES_URL] when
+     * blank, and blank (no update checks) when the saved value is not https.
+     */
     val effectiveUpdatesUrl: String
-        get() = updatesUrl.trim()
+        get() {
+            val v = updatesUrl.trim()
+            return when {
+                v.isEmpty() -> DEFAULT_UPDATES_URL
+                HttpGuard.isHttps(v) -> v
+                else -> ""
+            }
+        }
+
+    /** A usable server: set and https. A saved http:// value counts as not configured. */
+    val serverConfigured: Boolean get() = HttpGuard.isHttps(serverUrl)
+
+    /** [HTTPS_REQUIRED] when either URL is set to something other than https. */
+    val urlProblem: String?
+        get() = if ((serverUrl.isNotBlank() && !HttpGuard.isHttps(serverUrl)) ||
+            (updatesUrl.isNotBlank() && !HttpGuard.isHttps(updatesUrl))
+        ) HTTPS_REQUIRED else null
 
     /** `<base>` with any trailing slashes removed. */
-    val base: String get() = serverUrl.trimEnd('/')
+    val base: String get() = serverUrl.trim().trimEnd('/')
 
     val opdsUrl: String get() = "$base/opds"
     val kosyncUrl: String get() = "$base/kosync"
@@ -52,6 +71,12 @@ data class Config(
 
 /** Fallback name for this phone on the reader, when the phone reports none. */
 const val APP_HOST_NAME = "X4 Pro Sync"
+
+/** Update page used when the field is blank. GitHub redirects if the repository is renamed. */
+const val DEFAULT_UPDATES_URL = "https://github.com/jaymart1983/crosspoint-reader/releases/latest/download/"
+
+/** The one message for a server or update page that is not https. */
+const val HTTPS_REQUIRED = "Use an https:// address"
 
 /** The reader keeps at most this many bytes of a host name (BleLink BLE_HOST_NAME_MAX_BYTES). */
 private const val READER_HOST_NAME_MAX = 48
@@ -138,16 +163,16 @@ class SettingsStore(private val context: Context) {
 }
 
 /**
- * The host id + secret this phone presents to the reader.
+ * The pairing: the host id + secret this phone presents to the reader, and the
+ * reader's device id and Bluetooth address.
  *
- * Generated once and kept forever: the reader stores the same pair on its
- * side, so losing this means typing the six-digit code again (and leaving a
- * stale trusted host on the reader, which it can forget from its own UI).
+ * Written once, after `pair` and a hello whose reader_proof verified. A record
+ * without an address is a v1 (six-digit code) pairing, which a v2 reader no
+ * longer knows, and reads as unpaired.
  *
- * The secret is a plain DataStore string. That is honest about its strength:
- * it is a shared secret for a short-range radio link to an e-reader, not a
- * credential worth a Keystore-backed envelope. It is no better protected than
- * the OPDS password already sitting beside it.
+ * The secret is a plain DataStore string, excluded from backup (allowBackup is
+ * off). It rides a bonded, encrypted link and is no better or worse protected
+ * than the server password beside it.
  */
 class PairingStore(private val context: Context) {
 
@@ -156,7 +181,9 @@ class PairingStore(private val context: Context) {
         val hostName = stringPreferencesKey("ble_host_name")
         val secret = stringPreferencesKey("ble_host_secret")
         val deviceId = stringPreferencesKey("ble_device_id")
-        val trusted = booleanPreferencesKey("ble_trusted")
+        val address = stringPreferencesKey("ble_device_address")
+        // v1 only. Removed on save and clear.
+        val legacyTrusted = booleanPreferencesKey("ble_trusted")
         // The reader's own name, mirrored here so the connection pill can show
         // it at launch instead of after the first settings read.
         val deviceName = stringPreferencesKey("ble_device_name")
@@ -173,7 +200,8 @@ class PairingStore(private val context: Context) {
     val identity: Flow<HostIdentity?> = context.dataStore.data.map { p ->
         val id = p[K.hostId]
         val secret = p[K.secret]
-        if (id.isNullOrBlank() || secret.isNullOrBlank()) null
+        val address = p[K.address]
+        if (id.isNullOrBlank() || secret.isNullOrBlank() || address.isNullOrBlank()) null
         else HostIdentity(
             hostId = id,
             // The phone's current name, not whatever was stored at pairing: the reader
@@ -181,13 +209,13 @@ class PairingStore(private val context: Context) {
             hostName = phoneDisplayName(context),
             secret = secret,
             deviceId = p[K.deviceId],
-            trusted = p[K.trusted] ?: false,
+            address = address,
         )
     }
 
     suspend fun load(): HostIdentity? = identity.first()
 
-    /** A brand new identity, not yet stored. Persist it only if the reader takes it. */
+    /** A brand new identity, not yet stored. Persist it only once the reader has proved itself. */
     fun mint(hostName: String = phoneDisplayName(context)): HostIdentity = HostIdentity(
         hostId = UUID.randomUUID().toString(),
         hostName = hostName,
@@ -199,15 +227,18 @@ class PairingStore(private val context: Context) {
             p[K.hostId] = identity.hostId
             p[K.hostName] = identity.hostName
             p[K.secret] = identity.secret
-            identity.deviceId?.let { p[K.deviceId] = it }
-            p[K.trusted] = identity.trusted
+            val deviceId = identity.deviceId
+            if (deviceId != null) p[K.deviceId] = deviceId else p.remove(K.deviceId)
+            val address = identity.address
+            if (address != null) p[K.address] = address else p.remove(K.address)
+            p.remove(K.legacyTrusted)
         }
     }
 
     suspend fun clear() {
         context.dataStore.edit { p ->
             p.remove(K.hostId); p.remove(K.hostName); p.remove(K.secret)
-            p.remove(K.deviceId); p.remove(K.trusted); p.remove(K.deviceName)
+            p.remove(K.deviceId); p.remove(K.address); p.remove(K.legacyTrusted); p.remove(K.deviceName)
         }
     }
 }

@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.ParcelUuid
 import com.jmart.x4sync.data.BleClient
 import com.jmart.x4sync.data.BlePermissions
+import com.jmart.x4sync.data.PairingStore
 
 /**
  * Asks Android to watch for the reader on this app's behalf.
@@ -18,8 +19,9 @@ import com.jmart.x4sync.data.BlePermissions
  * A scan registered with a PendingIntent is held by the Bluetooth stack, not by
  * this process: when the reader wakes and advertises, the system delivers the
  * result to [ReaderPresenceReceiver] even if the app was closed or killed. The
- * filter is the reader's service UUID -- the same one the foreground connect
- * scans for -- and LOW_POWER lets the controller do the filtering.
+ * filter is the paired reader's Bluetooth address plus the service UUID, so no
+ * other advertiser wakes the app, and LOW_POWER lets the controller do the
+ * filtering.
  *
  * The registration does not survive a reboot, an app update or Bluetooth being
  * switched off, so it is renewed from each of those ([ReaderScanRegistrar]),
@@ -30,16 +32,31 @@ object ReaderPresence {
     private const val ACTION_FOUND = "com.jmart.x4sync.READER_FOUND"
     private const val REQUEST_CODE = 4202
 
-    @SuppressLint("MissingPermission")
-    fun register(context: Context): Boolean {
+    /** Registers for the paired reader's address. Unpaired: stops the scan and returns false. */
+    suspend fun register(context: Context): Boolean {
         val app = context.applicationContext
         if (!BlePermissions.granted(app)) return false
+        val address = runCatching { PairingStore(app).load()?.address }.getOrNull()
+        if (address.isNullOrBlank()) {
+            unregister(app)
+            return false
+        }
+        return registerFor(app, address)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun registerFor(app: Context, address: String): Boolean {
         val scanner = scanner(app) ?: return false
         val pi = pendingIntent(app)
         runCatching { scanner.stopScan(pi) }
         return runCatching {
             scanner.startScan(
-                listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(BleClient.SERVICE)).build()),
+                listOf(
+                    ScanFilter.Builder()
+                        .setDeviceAddress(address)
+                        .setServiceUuid(ParcelUuid(BleClient.SERVICE))
+                        .build()
+                ),
                 ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(),
                 pi,
             ) == 0

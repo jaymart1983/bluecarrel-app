@@ -26,11 +26,14 @@ class OpdsClient(
     private val pass: String,
 ) {
 
-    private fun request(url: String): Request = Request.Builder()
-        .url(url)
-        .header("Authorization", Credentials.basic(user, pass))
-        .header("Accept", "application/atom+xml")
-        .build()
+    /** Credentials only for the configured server's origin; feed links elsewhere go without. */
+    private fun request(url: String): Request {
+        val b = Request.Builder()
+            .url(url)
+            .header("Accept", "application/atom+xml")
+        if (HttpGuard.sameOrigin(url, baseUrl)) b.header("Authorization", Credentials.basic(user, pass))
+        return b.build()
+    }
 
     /** Fetch and parse one OPDS feed page. */
     suspend fun feed(path: String = "/new"): List<Book> = feedPage(path).books
@@ -53,7 +56,8 @@ class OpdsClient(
                 error("the server is behind Cloudflare Access, which is redirecting the app to a login page")
             }
             if (!resp.isSuccessful) error("OPDS ${resp.code} from $url")
-            parse(resp.body!!.byteStream(), url)
+            HttpGuard.checkDeclared(resp, HttpGuard.OPDS_FEED_MAX, "OPDS feed")
+            parse(HttpGuard.CappedInputStream(resp.body!!.byteStream(), HttpGuard.OPDS_FEED_MAX, "OPDS feed"), url)
         }
     }
 
@@ -104,31 +108,30 @@ class OpdsClient(
         val url = raw.toHttpUrlOrNull()
             ?: error("The download link for \"${book.title}\" is not a usable address: $raw")
 
-        http.newCall(request(url.toString())).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                error(
-                    when (resp.code) {
-                        404 -> "The server has no file for \"${book.title}\" " +
-                            "(404 from ${url.encodedPath}). Calibre lists the format " +
-                            "but the file is missing from the library folder."
-                        401, 403 -> "The server refused the download of " +
-                            "\"${book.title}\" (${resp.code}). Check the username and " +
-                            "password, and that the account may download."
-                        else -> "Download failed with ${resp.code} for \"${book.title}\""
-                    }
-                )
-            }
-            val body = resp.body ?: error("Empty response downloading \"${book.title}\"")
-            val total = body.contentLength()
-            if (onProgress == null) {
-                target.outputStream().use { out -> body.byteStream().copyTo(out) }
-            } else {
+        // Written to [target] as it arrives, so any abort deletes the partial file
+        // rather than leave it to be taken for a saved book.
+        val fetched = runCatching {
+            http.newCall(request(url.toString())).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    error(
+                        when (resp.code) {
+                            404 -> "The server has no file for \"${book.title}\" " +
+                                "(404 from ${url.encodedPath}). Calibre lists the format " +
+                                "but the file is missing from the library folder."
+                            401, 403 -> "The server refused the download of " +
+                                "\"${book.title}\" (${resp.code}). Check the username and " +
+                                "password, and that the account may download."
+                            else -> "Download failed with ${resp.code} for \"${book.title}\""
+                        }
+                    )
+                }
+                val body = resp.body ?: error("Empty response downloading \"${book.title}\"")
+                val total = body.contentLength()
+                val tooBig = "\"${book.title}\" is over 300 MB"
+                if (total > HttpGuard.BOOK_MAX) error(tooBig)
                 // Copied by hand rather than with copyTo so the caller can see
-                // it happening. A 3 MB book over a phone link is most of the
-                // wait before the reader transfer even starts, and reporting
-                // nothing for that whole stretch is what made saving a book
-                // look like it had stalled.
-                onProgress(0L, total)
+                // it happening, and so the byte count can be capped.
+                onProgress?.invoke(0L, total)
                 target.outputStream().use { out ->
                     val buf = ByteArray(64 * 1024)
                     var written = 0L
@@ -137,12 +140,13 @@ class OpdsClient(
                         while (true) {
                             val n = input.read(buf)
                             if (n < 0) break
-                            out.write(buf, 0, n)
                             written += n
+                            if (written > HttpGuard.BOOK_MAX) error(tooBig)
+                            out.write(buf, 0, n)
                             // Throttled: a progress bar redrawn every 64 KB is
                             // a lot of recompositions for a bar that only has a
                             // few hundred pixels to move.
-                            if (written - lastReport >= 256 * 1024 || written == total) {
+                            if (onProgress != null && (written - lastReport >= 256 * 1024 || written == total)) {
                                 lastReport = written
                                 onProgress(written, total)
                             }
@@ -150,6 +154,10 @@ class OpdsClient(
                     }
                 }
             }
+        }
+        fetched.exceptionOrNull()?.let { e ->
+            target.delete()
+            throw e
         }
         // A truncated or empty file is worse than none: it would sit on the
         // shelf looking saved, hash to nothing kosync knows, and be pushed to
@@ -177,7 +185,13 @@ class OpdsClient(
         var inEntry = false; var inAuthor = false
         var total = -1; var next: String? = null
 
+        // No DOCTYPE: a feed has no use for one, and entity expansion attacks
+        // start there. It can only come before the root element.
         var event = parser.eventType
+        while (event != XmlPullParser.START_TAG && event != XmlPullParser.END_DOCUMENT) {
+            if (event == XmlPullParser.DOCDECL) error("OPDS feed has a DOCTYPE")
+            event = parser.nextToken()
+        }
         while (event != XmlPullParser.END_DOCUMENT) {
             when (event) {
                 XmlPullParser.START_TAG -> when (parser.name) {

@@ -14,9 +14,14 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -65,9 +70,10 @@ import kotlin.coroutines.resumeWithException
  *  - Upload flow control is credit-based: the client declares `ack_bytes` in
  *    `start_put` and must pause until the status JSON reports `received` has
  *    caught up, otherwise the reader's event queue overflows.
- *  - The trusted-host HMAC key is the ASCII of the 64-char hex secret, *not*
- *    the 32 bytes it decodes to. Getting this wrong fails silently as
- *    "invalid trusted host auth".
+ *  - Security v2 (protocol_version 2, crosspoint-x4pro docs/security-v2.md):
+ *    the link is bonded and encrypted (LE Secure Connections, passkey entry),
+ *    and on top of it a mutual HMAC-SHA256 keyed with the 32 RAW secret bytes.
+ *    The session is authorised only after the reader's `reader_proof` verifies.
  *
  * NONE of this has been tested against real hardware.
  */
@@ -101,6 +107,12 @@ class BleClient(private val context: Context) {
         private const val SCAN_TIMEOUT_MS = 15_000L
         private const val COMMIT_TIMEOUT_MS = 120_000L
 
+        /** The user reads the passkey off the reader and types it. */
+        private const val BOND_TIMEOUT_MS = 60_000L
+
+        /** The reader must speak security v2. */
+        const val PROTOCOL_VERSION = 2
+
         /** The reader rejects anything this does not match ("unsafe ... filename"). */
         private val SAFE_NAME = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
@@ -129,15 +141,59 @@ class BleClient(private val context: Context) {
             return md.digest().toHex()
         }
 
-        /**
-         * HMAC-SHA256 over the exact string "{nonce}|{hostId}|1", keyed with the
-         * UTF-8 bytes of the hex secret string.
-         */
-        fun trustedHostResponse(secret: String, nonce: String, hostId: String): String {
-            val mac = Mac.getInstance("HmacSHA256")
-            mac.init(SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
-            return mac.doFinal("$nonce|$hostId|1".toByteArray(Charsets.UTF_8)).toHex()
+        /** 16 random bytes as 32 lowercase hex: a hello's client_nonce. */
+        fun newClientNonce(): String {
+            val bytes = ByteArray(16)
+            SecureRandom().nextBytes(bytes)
+            return bytes.toHex()
         }
+
+        /** Hex to bytes; null for an odd length or a non-hex character. */
+        fun hexToBytes(hex: String): ByteArray? {
+            if (hex.length % 2 != 0) return null
+            val out = ByteArray(hex.length / 2)
+            for (i in out.indices) {
+                val hi = Character.digit(hex[i * 2], 16)
+                val lo = Character.digit(hex[i * 2 + 1], 16)
+                if (hi < 0 || lo < 0) return null
+                out[i] = ((hi shl 4) or lo).toByte()
+            }
+            return out
+        }
+
+        /**
+         * HMAC-SHA256 keyed with the 32 raw bytes of [secretHex], over
+         * "X4AUTH2|<role>|D|C|H|I": D the reader's device_nonce, C the client
+         * nonce, H the host id, I the reader's device_id. [role] is "host" for the
+         * hello response and "reader" for the proof the reader returns.
+         */
+        fun authMac(
+            secretHex: String,
+            role: String,
+            deviceNonce: String,
+            clientNonce: String,
+            hostId: String,
+            deviceId: String,
+        ): ByteArray {
+            val key = hexToBytes(secretHex)?.takeIf { it.size == 32 }
+                ?: throw IllegalArgumentException("host secret must be 64 hex characters")
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(key, "HmacSHA256"))
+            return mac.doFinal(
+                "X4AUTH2|$role|$deviceNonce|$clientNonce|$hostId|$deviceId".toByteArray(Charsets.UTF_8)
+            )
+        }
+
+        /** Constant-time check of a hex reader_proof against the expected MAC. */
+        fun proofMatches(expected: ByteArray, proofHex: String): Boolean {
+            val got = hexToBytes(proofHex.trim()) ?: return false
+            return MessageDigest.isEqual(expected, got)
+        }
+
+        /** Reader errors meaning this session is not, or no longer, authenticated. */
+        fun isAuthError(code: String?): Boolean =
+            code != null && (code.contains("session") || code.contains("auth") ||
+                code.contains("trusted host") || code.contains("pair"))
 
         /**
          * How an ordinary upload ends. `save_host_prompt` is deliberately not
@@ -203,6 +259,9 @@ class BleClient(private val context: Context) {
 
     @Volatile private var mtu: Int = DEFAULT_MTU
     @Volatile private var authorized: Boolean = false
+
+    /** The device_id the verified hello was made with. A status naming another reader drops authorisation. */
+    @Volatile private var authedDeviceId: String? = null
 
     /** Serializes GATT operations: the stack allows exactly one in flight. */
     private val opLock = Mutex()
@@ -281,6 +340,12 @@ class BleClient(private val context: Context) {
 
         /** The reader refused our credentials. */
         AUTH,
+
+        /** Android bonding did not complete, or the phone is not bonded with the reader. */
+        BOND,
+
+        /** The reader's protocol_version is below 2. */
+        OLD_FIRMWARE,
 
         /** The reader refused an operation. [BleException.code] has its word. */
         PROTOCOL,
@@ -416,9 +481,12 @@ class BleClient(private val context: Context) {
 
     private fun publishStatus(raw: ByteArray) {
         val parsed = DeviceStatus.parse(String(raw, Charsets.UTF_8)) ?: return
-        // "session code required" means the reader dropped our authorisation.
-        if (parsed.state == "error" && parsed.error == "session code required") authorized = false
-        if (parsed.trustedHost) authorized = true
+        // A status can take authorisation away, never grant it: only a verified
+        // reader_proof does that (authenticateLocked).
+        if (parsed.state == "error" && isAuthError(parsed.error)) authorized = false
+        if (parsed.authError != null && !parsed.trustedHost) authorized = false
+        val authedId = authedDeviceId
+        if (authedId != null && parsed.deviceId != null && parsed.deviceId != authedId) authorized = false
         _status.value = parsed
         statusUpdates.tryEmit(parsed)
     }
@@ -430,6 +498,7 @@ class BleClient(private val context: Context) {
         ioGate?.completeExceptionally(cause)
         control = null; dataIn = null; statusChar = null; dataOut = null
         authorized = false
+        authedDeviceId = null
         mtu = DEFAULT_MTU
         _connection.value = BleConnection.IDLE
     }
@@ -452,14 +521,28 @@ class BleClient(private val context: Context) {
         context.getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
     }.getOrDefault(false)
 
-    /** Scan (never by name — the reader is discovered by service UUID), connect, set up. */
+    /**
+     * Scan, connect, bond, set up.
+     *
+     * [address] null scans by service UUID alone (pairing); otherwise only that
+     * address, plus the service UUID, is scanned for and connected to.
+     * [allowBond] lets an unbonded reader be bonded here, with Android's system
+     * dialog taking the passkey the reader shows. Without it an unbonded reader
+     * is refused, so a background reconnect never raises a pairing dialog.
+     *
+     * Refuses a reader below protocol_version 2.
+     */
     @SuppressLint("MissingPermission")
-    suspend fun connect(): DeviceStatus {
-        if (_connection.value == BleConnection.CONNECTED) return readStatus()
+    suspend fun connect(address: String? = null, allowBond: Boolean = false): DeviceStatus {
+        if (_connection.value == BleConnection.CONNECTED &&
+            (address == null || gatt?.device?.address.equals(address, ignoreCase = true))
+        ) {
+            return readStatus()
+        }
         disconnect()
         _connection.value = BleConnection.SCANNING
         try {
-            val device = scanForReader()
+            val device = scanForReader(address)
             _connection.value = BleConnection.CONNECTING
 
             connectGate = CompletableDeferred()
@@ -467,6 +550,17 @@ class BleClient(private val context: Context) {
                 ?: throw BleException("Could not open a GATT connection")
             gatt = g
             withTimeout(CONNECT_TIMEOUT_MS) { connectGate!!.await() }
+
+            // Bonded before anything else: every characteristic needs an
+            // encrypted, authenticated link.
+            if (device.bondState != BluetoothDevice.BOND_BONDED) {
+                if (!allowBond) {
+                    throw BleException("This phone is not paired with the reader", reason = Reason.BOND)
+                }
+                _connection.value = BleConnection.BONDING
+                ensureBonded(device)
+                _connection.value = BleConnection.CONNECTING
+            }
 
             // MTU first: the negotiated value decides our frame size, and
             // renegotiating after discovery is not reliable across vendors.
@@ -499,6 +593,9 @@ class BleClient(private val context: Context) {
             enableNotifications(dataOut!!)
 
             val initial = readStatus()
+            if ((initial.protocolVersion ?: 0) < PROTOCOL_VERSION) {
+                throw BleException("Update the reader firmware", reason = Reason.OLD_FIRMWARE)
+            }
             _connection.value = BleConnection.CONNECTED
             return initial
         } catch (e: Throwable) {
@@ -508,6 +605,62 @@ class BleClient(private val context: Context) {
                 e.message ?: "Could not connect to the reader",
                 reason = Reason.LINK,
             )
+        }
+    }
+
+    /** The connected reader's Bluetooth address, or null. */
+    @SuppressLint("MissingPermission")
+    fun connectedAddress(): String? = gatt?.device?.address
+
+    /**
+     * Bonds with [device] and waits for ACTION_BOND_STATE_CHANGED to report
+     * BONDED. Android's system dialog asks for the passkey on the reader's screen.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun ensureBonded(device: BluetoothDevice) {
+        val done = CompletableDeferred<Int>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, intent: Intent) {
+                val d = IntentCompat.getParcelableExtra(
+                    intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java,
+                )
+                if (d == null || !d.address.equals(device.address, ignoreCase = true)) return
+                val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+                val previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
+                if (state == BluetoothDevice.BOND_BONDED ||
+                    (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDING)
+                ) {
+                    done.complete(state)
+                }
+            }
+        }
+        // Exported on purpose: ACTION_BOND_STATE_CHANGED is a protected broadcast
+        // from the Bluetooth process, and NOT_EXPORTED below API 33 adds a
+        // permission that sender does not hold. Registered before createBond so
+        // no event can be missed.
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        try {
+            if (device.bondState == BluetoothDevice.BOND_BONDED) return
+            if (device.bondState != BluetoothDevice.BOND_BONDING && !device.createBond()) {
+                throw BleException("Could not start pairing", reason = Reason.BOND)
+            }
+            val deadline = System.currentTimeMillis() + BOND_TIMEOUT_MS
+            while (true) {
+                val state = withTimeoutOrNull(500) { done.await() } ?: device.bondState
+                if (state == BluetoothDevice.BOND_BONDED) return
+                if (done.isCompleted) throw BleException("Pairing failed", reason = Reason.BOND)
+                if (gatt == null) throw BleException("The reader dropped the link while pairing", reason = Reason.BOND)
+                if (System.currentTimeMillis() > deadline) {
+                    throw BleException("Pairing timed out", reason = Reason.BOND)
+                }
+            }
+        } finally {
+            runCatching { context.unregisterReceiver(receiver) }
         }
     }
 
@@ -524,7 +677,7 @@ class BleClient(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun scanForReader(): BluetoothDevice {
+    private suspend fun scanForReader(address: String?): BluetoothDevice {
         val scanner = adapter().bluetoothLeScanner
             ?: throw BleException("Bluetooth scanning is unavailable", reason = Reason.SCAN_FAILED)
         return withTimeoutOrNull(SCAN_TIMEOUT_MS) {
@@ -533,6 +686,7 @@ class BleClient(private val context: Context) {
                 val cb = object : ScanCallback() {
                     override fun onScanResult(callbackType: Int, result: ScanResult) {
                         if (settled) return
+                        if (address != null && !result.device.address.equals(address, ignoreCase = true)) return
                         settled = true
                         runCatching { scanner.stopScan(this) }
                         cont.resume(result.device)
@@ -555,7 +709,12 @@ class BleClient(private val context: Context) {
                 }
                 runCatching {
                     scanner.startScan(
-                        listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
+                        listOf(
+                            ScanFilter.Builder()
+                                .setServiceUuid(ParcelUuid(SERVICE))
+                                .apply { if (address != null) setDeviceAddress(address) }
+                                .build()
+                        ),
                         ScanSettings.Builder()
                             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                             .build(),
@@ -631,7 +790,7 @@ class BleClient(private val context: Context) {
         // change, and a notification is capped at ATT_MTU-3 and sheds fields to
         // fit, `trusted_host` among them -- so a read meant to confirm
         // authentication could come back without the field and send the app
-        // asking for a six-digit code the reader is not waiting for.
+        // back into a hello it did not need.
         return DeviceStatus.parse(String(bytes, Charsets.UTF_8))
             ?: throw BleException("Reader returned an unreadable status")
     }
@@ -707,12 +866,7 @@ class BleClient(private val context: Context) {
 
     private fun failIfError(s: DeviceStatus) {
         if (s.state != "error") return
-        val reason = when (s.error) {
-            "invalid session code", "session code required", "invalid trusted host auth",
-            "unknown trusted host", "invalid trusted host setup",
-            -> Reason.AUTH
-            else -> Reason.PROTOCOL
-        }
+        val reason = if (isAuthError(s.error)) Reason.AUTH else Reason.PROTOCOL
         throw BleException(friendlyError(s.error), s.error, reason)
     }
 
@@ -746,20 +900,53 @@ class BleClient(private val context: Context) {
     /**
      * Drops the belief that this session is authenticated.
      *
-     * Needed because authenticateTrusted() suppresses a second hello while
+     * Needed because authenticate() suppresses a second hello while
      * `authorized` is true: without a way to clear it, a session the reader has
      * forgotten (it rebooted) can never be re-authenticated.
      */
     fun markUnauthorized() {
         authorized = false
+        authedDeviceId = null
     }
 
     /**
-     * Reconnects an already-trusted host: HMAC-SHA256 over
-     * "{device_nonce}|{host_id}|1". Returns false when the reader has no
-     * nonce or refuses us, so the caller can fall back to the code.
+     * Stores this phone on the reader:
+     *
+     *     {"op":"pair","version":2,"host_id":H,"host_name":N,"secret":"<64 hex>"}
+     *
+     * Sent only on a connected link Android reports BOND_BONDED, and only while
+     * the reader's status says `pairing_window`. The answer authorises nothing;
+     * the caller follows with [authenticate], whose reader_proof does.
      */
-    suspend fun authenticateTrusted(identity: HostIdentity): Boolean = authLock.withLock {
+    @SuppressLint("MissingPermission")
+    suspend fun pair(identity: HostIdentity): DeviceStatus = authLock.withLock {
+        val device = gatt?.device ?: throw BleException("Not connected", reason = Reason.LINK)
+        if (_connection.value != BleConnection.CONNECTED || device.bondState != BluetoothDevice.BOND_BONDED) {
+            throw BleException("This phone is not paired with the reader", reason = Reason.BOND)
+        }
+        val pre = readStatus()
+        if (!pre.pairingWindow) {
+            throw BleException(friendlyError("pairing window closed"), "pairing window closed", Reason.AUTH)
+        }
+        val command = JSONObject()
+            .put("op", "pair")
+            .put("version", PROTOCOL_VERSION)
+            .put("host_id", identity.hostId)
+            .put("host_name", identity.hostName)
+            .put("secret", identity.secret)
+        val awaited = runCatching {
+            commandAwait(command, 8_000) { it.paired || it.authError != null || it.state == "error" }
+        }.getOrNull()
+        val verdict = readStatus()
+        if (verdict.paired || awaited?.paired == true) return@withLock verdict
+        val refusal = verdict.authError ?: awaited?.authError
+            ?: verdict.error?.takeIf { verdict.state == "error" }
+        if (refusal != null) throw BleException(friendlyError(refusal), refusal, Reason.AUTH)
+        verdict
+    }
+
+    /** Authenticates with a v2 hello, unless this session already is. */
+    suspend fun authenticate(identity: HostIdentity): Boolean = authLock.withLock {
         // Whoever lost the race has nothing to do: the session is already through
         // the gate, and a second hello would spend the fresh nonce for no gain --
         // and a hello against a spent nonce is REFUSED, which tears down the
@@ -768,104 +955,81 @@ class BleClient(private val context: Context) {
             lastAuthTrace = "already authorised; second hello suppressed"
             return@withLock true
         }
-        authenticateTrustedLocked(identity)
-    }
-
-    private suspend fun authenticateTrustedLocked(identity: HostIdentity): Boolean {
-        // Always a fresh GATT read, never the cached status. Two independent
-        // reasons, either of which breaks silent reconnection on its own:
-        //
-        //  - The reader rotates device_nonce every time it accepts a hello, so a
-        //    nonce left over from the previous session is already spent and the
-        //    HMAC computed over it is refused as "invalid trusted host auth".
-        //  - Notification statuses drop device_nonce entirely to fit inside
-        //    ATT_MTU-3 (see DeviceStatus.pending), so the cached value is very
-        //    often null even within one session.
-        //
-        // Both failures land the user back on the six-digit code despite being
-        // paired, which is the one thing pairing is supposed to prevent.
-        val trace = StringBuilder()
-        fun note(s: String) { trace.append(s).append('\n'); lastAuthTrace = trace.toString().trim() }
-        note("host=${identity.hostId.take(8)}… trusted=${identity.trusted}")
-        val preRead = runCatching { readStatus() }
-        preRead.exceptionOrNull()?.let {
-            note("pre-read FAILED: ${it.message}")
-            return false
-        }
-        val nonce = preRead.getOrNull()?.deviceNonce
-        note("nonce=${if (nonce.isNullOrBlank()) "ABSENT" else "ok(${nonce.length})"}")
-        if (nonce.isNullOrBlank()) return false
-        val command = JSONObject()
-            .put("op", "hello")
-            .put("version", 1)
-            .put("host_id", identity.hostId)
-            // The reader updates the stored label when this differs (renamed app).
-            .put("host_name", identity.hostName)
-            .put("response", trustedHostResponse(identity.secret, nonce, identity.hostId))
-        // The verdict is taken from a READ, not from the notification.
-        //
-        // The firmware is explicit that "the notification is a doorbell, the read
-        // is authoritative": a notify is capped at ATT_MTU-3 and sheds fields to
-        // fit -- `trusted_host` among them -- so it is not a document any decision
-        // should rest on. Confirming authentication from one meant the reader
-        // could log "trusted host accepted" while this returned false, and the
-        // user was asked for a six-digit code the reader was not waiting for.
-        //
-        // So: ring the doorbell, give it a moment, then go and look. A timeout on
-        // the notification is not a failure -- it is only the absence of a hint.
-        val awaited = runCatching {
-            commandAwait(command, 5_000) { it.trustedHost || it.state == "error" }
-        }
-        note("hello await=" + awaited.fold(
-            { "state=${it.state} trustedHost=${it.trustedHost}" },
-            { "timeout/err: ${it.message}" },
-        ))
-        val verdictRead = runCatching { readStatus() }
-        verdictRead.exceptionOrNull()?.let {
-            note("verdict read FAILED: ${it.message}")
-            return false
-        }
-        val verdict = verdictRead.getOrNull()!!
-        note("verdict state=${verdict.state} trusted_host=${verdict.trustedHostName ?: "-"} " +
-            "has_trusted=${verdict.hasTrustedHost} auth_error=${verdict.error ?: "-"}")
-        failIfError(verdict)
-        // Only the named host counts. `state` is NOT evidence of authentication:
-        // the firmware sets State::CONNECTED the moment a peer attaches, with
-        // helloAccepted_ still false, so treating "connected" as success would
-        // report an unauthenticated link as paired. `trusted_host` is set only
-        // when a trusted hello is accepted, and a READ never sheds it.
-        // Either witness will do. The notification is shed-prone but never lies
-        // when the field IS present, and the read is authoritative when it
-        // arrives intact. Requiring the read alone is what turned a successful
-        // authentication into a code prompt.
-        val awaitSaidTrusted = awaited.getOrNull()?.trustedHost == true
-        authorized = verdict.trustedHost || awaitSaidTrusted
-        note("RESULT authorized=$authorized (read=${verdict.trustedHost} notify=$awaitSaidTrusted)")
-        return authorized
+        authenticateLocked(identity)
     }
 
     /**
-     * First-time authorisation with the six-digit code on the reader's screen,
-     * carrying the host identity we want saved.
+     * The v2 hello:
      *
-     * The reader saves the host on this hello, the moment it accepts the code.
-     * `save_host` is still accepted as a no-op by the firmware for older clients.
+     *     {"op":"hello","version":2,"host_id":H,"host_name":N,"client_nonce":C,"response":R}
+     *
+     * R = HMAC(secret, "X4AUTH2|host|D|C|H|I"). The reader answers with
+     * reader_proof = HMAC(secret, "X4AUTH2|reader|D|C|H|I") over the same,
+     * pre-rotation D. Authorised only when that proof verifies in constant time,
+     * for the device_id the pairing stored.
      */
-    suspend fun helloWithCode(code: String, identity: HostIdentity): DeviceStatus {
-        require(Regex("^\\d{6}$").matches(code)) { "Code must be six digits" }
+    private suspend fun authenticateLocked(identity: HostIdentity): Boolean {
+        val trace = StringBuilder()
+        fun note(s: String) { trace.append(s).append('\n'); lastAuthTrace = trace.toString().trim() }
+        note("host=${identity.hostId.take(8)}… reader=${identity.deviceId?.take(8) ?: "?"}")
+        authorized = false
+        authedDeviceId = null
+        // Always a fresh GATT read, never the cached status: the reader rotates
+        // device_nonce on every accepted hello, and notifications can shed it.
+        val pre = runCatching { readStatus() }.getOrElse {
+            note("pre-read FAILED: ${it.message}")
+            return false
+        }
+        if ((pre.protocolVersion ?: 0) < PROTOCOL_VERSION) {
+            note("protocol_version=${pre.protocolVersion ?: "-"}")
+            return false
+        }
+        val d = pre.deviceNonce
+        val i = pre.deviceId
+        note("nonce=${if (d.isNullOrBlank()) "ABSENT" else "ok(${d.length})"} device=${i?.take(8) ?: "ABSENT"}")
+        if (d.isNullOrBlank() || i.isNullOrBlank()) return false
+        if (identity.deviceId != null && identity.deviceId != i) {
+            note("different reader")
+            return false
+        }
+        val c = newClientNonce()
+        val h = identity.hostId
+        val macs = try {
+            authMac(identity.secret, "host", d, c, h, i).toHex() to
+                authMac(identity.secret, "reader", d, c, h, i)
+        } catch (e: IllegalArgumentException) {
+            note("bad stored secret")
+            return false
+        }
+        val response = macs.first
+        val expected = macs.second
         val command = JSONObject()
             .put("op", "hello")
-            .put("version", 1)
-            .put("code", code)
-            .put("pair_host_id", identity.hostId)
-            .put("pair_host_name", identity.hostName)
-            .put("pair_secret", identity.secret)
-        val result = commandAwait(command, 8_000) {
-            it.state == "connected" || it.trustedHost || it.state == "error"
+            .put("version", PROTOCOL_VERSION)
+            .put("host_id", h)
+            .put("host_name", identity.hostName)
+            .put("client_nonce", c)
+            .put("response", response)
+        // Ring the doorbell, then read: a notification is capped at ATT_MTU-3 and
+        // can shed fields, so the proof is taken from whichever one carries it.
+        val awaited = runCatching {
+            commandAwait(command, 5_000) { it.readerProof != null || it.authError != null || it.state == "error" }
         }
-        failIfError(result)
-        authorized = true
-        return result
+        note("hello await=" + awaited.fold(
+            { "proof=${it.readerProof != null} auth_error=${it.authError ?: "-"}" },
+            { "timeout/err: ${it.message}" },
+        ))
+        val verdict = runCatching { readStatus() }.getOrNull()
+        note("verdict proof=${verdict?.readerProof != null} auth_error=${verdict?.authError ?: verdict?.error ?: "-"}")
+        val proofOk = listOfNotNull(awaited.getOrNull()?.readerProof, verdict?.readerProof)
+            .any { proofMatches(expected, it) }
+        val verdictId = verdict?.deviceId
+        val sameReader = verdictId == null || verdictId == i
+        val ok = proofOk && sameReader
+        authedDeviceId = if (ok) i else null
+        authorized = ok
+        note("RESULT authorized=$ok (proof=$proofOk sameReader=$sameReader)")
+        return ok
     }
 
     /**
@@ -916,12 +1080,17 @@ class BleClient(private val context: Context) {
          * an ordinary send relies on "exists" to learn a book is already there.
          */
         replace: Boolean = false,
-        /** Build stamp for a firmware image; the reader shows it on its update screens. */
+        /** Build stamp for a firmware image (yyyyMMdd.HHmm). Required for firmware. */
         version: String? = null,
+        /** firmware.json `signature` (hex). Required for firmware; the reader verifies it. */
+        signature: String? = null,
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     ): UploadResult {
         val total = file.length()
         if (total <= 0L) throw BleException("\"$name\" is empty")
+        if (kind == "firmware" && (version.isNullOrBlank() || signature.isNullOrBlank())) {
+            throw BleException("Unsigned firmware")
+        }
         return uploadCore(
             name = name,
             kind = kind,
@@ -932,6 +1101,7 @@ class BleClient(private val context: Context) {
             onProgress = onProgress,
             replace = replace,
             version = version,
+            signature = signature,
         )
     }
 
@@ -986,8 +1156,9 @@ class BleClient(private val context: Context) {
         commitDone: (DeviceStatus) -> Boolean = DEFAULT_COMMIT_DONE,
         replace: Boolean = false,
         version: String? = null,
+        signature: String? = null,
     ): UploadResult = transferLock.withLock {
-        if (!authorized) throw BleException("Authorise this session first (enter the reader's code)")
+        if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         val dataInChar = dataIn ?: throw BleException("Not connected")
         if (name != null && !isSafeTransferName(name)) {
             throw BleException("\"$name\" is not a name the reader will accept")
@@ -1015,6 +1186,7 @@ class BleClient(private val context: Context) {
         // exactly the request it always has.
         if (replace) startPut.put("replace", true)
         if (version != null) startPut.put("version", version)
+        if (signature != null) startPut.put("signature", signature)
 
         try {
             val ready = commandAwait(startPut, 15_000) {
@@ -1122,7 +1294,7 @@ class BleClient(private val context: Context) {
         kind: String,
         onProgress: (received: Long) -> Unit = {},
     ): ByteArray = transferLock.withLock {
-        if (!authorized) throw BleException("Authorise this session first (enter the reader's code)")
+        if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         val chunks = mutableListOf<ByteArray>()
         var received = 0L
         var expected = 0L
@@ -1199,11 +1371,11 @@ class BleClient(private val context: Context) {
     private fun friendlyError(code: String?): String = when (code) {
         null -> "The reader rejected the operation"
         "exists" -> "That file is already on the reader"
-        "session code required" ->
-            "The reader wants the six-digit code again"
-        "invalid session code" -> "That code was not accepted"
+        "pairing window closed" -> "On the reader, open Settings"
+        "invalid pair request" -> "The reader refused the pairing"
         "invalid trusted host auth", "unknown trusted host" ->
-            "The reader no longer trusts this phone — pair again with the code"
+            "The reader does not know this phone. Pair again."
+        "signature required" -> "Unsigned firmware"
         "unsafe book filename" ->
             "The reader rejected the filename. Letters, numbers, dots, dashes and underscores only."
         "invalid book size" -> "The reader rejected the file size"
@@ -1228,4 +1400,4 @@ class BleClient(private val context: Context) {
     }
 }
 
-enum class BleConnection { IDLE, SCANNING, CONNECTING, CONNECTED }
+enum class BleConnection { IDLE, SCANNING, CONNECTING, BONDING, CONNECTED }

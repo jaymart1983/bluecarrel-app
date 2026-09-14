@@ -35,6 +35,8 @@ import java.io.File
 class CoverCache(
     private val http: OkHttpClient,
     private val cacheDir: File,
+    /** The configured server. Credentials go only to its origin. */
+    private val serverUrl: () -> String = { "" },
 ) {
     private val memory: LruCache<String, Bitmap> =
         object : LruCache<String, Bitmap>(
@@ -62,10 +64,12 @@ class CoverCache(
 
             val bytes = runCatching {
                 val req = Request.Builder().url(url)
-                    .header("Authorization", Credentials.basic(user, pass))
-                    .build()
-                http.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) null else r.body?.bytes()
+                // A cover anywhere but the configured server goes without credentials.
+                if (HttpGuard.sameOrigin(url, serverUrl())) {
+                    req.header("Authorization", Credentials.basic(user, pass))
+                }
+                http.newCall(req.build()).execute().use { r ->
+                    if (!r.isSuccessful) null else HttpGuard.bytes(r, HttpGuard.COVER_MAX, "Cover")
                 }
             }.getOrNull() ?: return@withContext null
 

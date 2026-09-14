@@ -4,6 +4,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.jmart.x4sync.X4SyncApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * The reader turned up. Start the background service, which connects.
@@ -29,7 +32,17 @@ class ReaderPresenceReceiver : BroadcastReceiver() {
 class ReaderScanRegistrar : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
-            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> ReaderPresence.register(context)
+            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                // The paired address is in DataStore, which is read off the main thread.
+                val pending = goAsync()
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        ReaderPresence.register(context)
+                    } finally {
+                        pending.finish()
+                    }
+                }
+            }
         }
     }
 }

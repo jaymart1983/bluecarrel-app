@@ -272,6 +272,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /** Following an install: how often the reader is asked, and for how long. */
         const val FIRMWARE_WATCH_POLL_MS = 20_000L
         const val FIRMWARE_INSTALL_TIMEOUT_MS = 15 * 60_000L
+        /** What to do to pair: the reader opens its pairing window on its Settings screen. */
+        const val PAIR_HINT = "On the reader, open Settings"
     }
 
     private val settings = SettingsStore(app)
@@ -284,7 +286,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Completed by [answerResume]; awaited by the save that raised the prompt. */
     private var resumeAnswer: CompletableDeferred<Boolean>? = null
     private val books = BookStore(app)
-    val covers by lazy { CoverCache(http, app.cacheDir) }
+    val covers by lazy { CoverCache(http, app.cacheDir) { _state.value.config.base } }
 
     // OPDS, kosync and the update page are reached over HTTP; only the reader is on BLE.
     private val http = OkHttpClient.Builder()
@@ -340,9 +342,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 config = settings.config.first(),
                 deviceName = runCatching { pairingStore.deviceName.first() }.getOrDefault(""),
                 permissionsGranted = BlePermissions.granted(getApplication()),
-                pairing = identity?.let {
-                    if (it.trusted) PairingState.TRUSTED else PairingState.CODE_AUTHORIZED
-                } ?: PairingState.UNPAIRED,
+                pairing = if (identity != null) PairingState.TRUSTED else PairingState.UNPAIRED,
                 hasStoredPairing = identity != null,
                 storedHostId = identity?.hostId,
             )
@@ -378,6 +378,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     link = when (c) {
                         BleConnection.SCANNING -> LinkStatus(LinkStage.SCANNING)
                         BleConnection.CONNECTING -> LinkStatus(LinkStage.CONNECTING)
+                        BleConnection.BONDING -> LinkStatus(
+                            LinkStage.BONDING,
+                            hint = "Enter the passkey shown on the reader",
+                        )
                         // CONNECTED and IDLE are decided by the authorisation
                         // step, not by the transport, so they are left to
                         // connectReader() rather than guessed at here.
@@ -426,21 +430,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         focus = p.offset,
                     )
                 }
-                // The reader prompts on its own screen to save a trusted host
-                // after the first authenticated upload. That confirmation can
-                // land at any time, so promote the stored identity whenever we
-                // see it rather than only in the upload path.
-                if ((s.paired || s.trustedHost) && _state.value.pairing != PairingState.TRUSTED) {
-                    promoteToTrusted(s.deviceId)
-                }
-                // The reader can also refuse to remember us. Say so rather than
-                // leaving the banner claiming a pairing that will not survive.
-                if (s.pairing == "skipped" && _state.value.pairing != PairingState.TRUSTED) {
-                    _state.value = _state.value.copy(
-                        message = "The reader didn't save this phone",
-                    )
-                }
-
                 // --- the heartbeat ------------------------------------------
                 //
                 // The reader volunteers where it is and what it holds, so most
@@ -539,6 +528,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------- settings
 
     fun saveConfig(c: Config) = viewModelScope.launch {
+        c.urlProblem?.let {
+            _state.value = _state.value.copy(message = it)
+            return@launch
+        }
         settings.save(c)
         _state.value = _state.value.copy(config = c, message = "Settings saved")
         refresh()
@@ -563,7 +556,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             ),
         )
         if (granted) {
-            ReaderPresence.register(getApplication())
+            viewModelScope.launch { ReaderPresence.register(getApplication()) }
             connectReader()
         }
     }
@@ -571,8 +564,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------- reader link
 
     /**
-     * Scan, connect, and authorise. A stored identity authenticates silently
-     * over HMAC; otherwise the UI asks for the six-digit code.
+     * Scan, connect and authorise the paired reader: its stored address only,
+     * then a v2 hello whose reader_proof must verify. Unpaired, nothing is
+     * scanned and the UI asks the user to pair ([pairReader]).
      *
      * [silent] suppresses the snackbar on failure. Used for the automatic
      * attempt at launch, where "no reader found" means "the reader is in a
@@ -586,24 +580,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Android throttled this app's scans and the reader could not be found at all.
         connectJob?.takeIf { it.isActive }?.let { return it }
         return viewModelScope.launch {
-        if (!BlePermissions.granted(getApplication())) {
+        if (!linkPreflight()) return@launch
+
+        val identity = pairingStore.load()
+        if (identity == null) {
             _state.value = _state.value.copy(
-                permissionsGranted = false,
-                link = LinkStatus(
-                    LinkStage.NEEDS_PERMISSION,
-                    reason = "Bluetooth permission is not granted",
-                    hint = BlePermissions.denialMessage,
-                ),
-            )
-            return@launch
-        }
-        if (!ble.bluetoothEnabled()) {
-            _state.value = _state.value.copy(
-                link = LinkStatus(
-                    LinkStage.BLUETOOTH_OFF,
-                    reason = "Bluetooth is off",
-                    hint = "Turn Bluetooth on, then connect.",
-                ),
+                pairing = PairingState.UNPAIRED,
+                link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = null, hint = PAIR_HINT),
             )
             return@launch
         }
@@ -614,70 +597,38 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             link = LinkStatus(LinkStage.SCANNING),
         )
 
-        val outcome = runCatching { ble.connect() }
+        // Never bonds here: a background reconnect must not raise a pairing dialog.
+        val outcome = runCatching { ble.connect(identity.address, allowBond = false) }
         val status = outcome.getOrElse { e ->
             failLink(e, silent)
             return@launch
         }
 
-        val identity = pairingStore.load()
-        if (identity == null) {
+        if (identity.deviceId != null && status.deviceId != identity.deviceId) {
+            ble.disconnect()
             _state.value = _state.value.copy(
-                pairing = PairingState.UNPAIRED,
+                authorized = false,
                 link = LinkStatus(
-                    LinkStage.NEEDS_CODE,
-                    reason = "Not paired with this reader",
-                    hint = "Enter the code shown on the reader.",
-                ),
-            )
-            return@launch
-        }
-        if (identity.deviceId != null && status.deviceId != null &&
-            identity.deviceId != status.deviceId
-        ) {
-            _state.value = _state.value.copy(
-                pairing = PairingState.UNPAIRED,
-                link = LinkStatus(
-                    LinkStage.NEEDS_CODE,
+                    LinkStage.FAILED,
                     reason = "A different reader",
-                    hint = "Enter its code to pair.",
+                    hint = "Forget pairing to pair it",
                 ),
             )
             return@launch
         }
 
         _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
-        val ok = runCatching { ble.authenticateTrusted(identity) }.getOrDefault(false)
+        val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
         if (ok) {
-            linkFailStreak = 0
-            promoteToTrusted(status.deviceId)
-            _state.value = _state.value.copy(
-                authorized = true,
-                pairing = PairingState.TRUSTED,
-                link = LinkStatus(LinkStage.CONNECTED),
-                message = if (silent) null
-                else "Connected to ${status.firmwareName ?: "the reader"}",
-            )
-            // The reader has no clock of its own worth trusting; tell it the
-            // time and the zone before anything else uses a timestamp.
-            runCatching { ble.setDeviceTime() }
-            // The shelf is the contract: whatever is saved offline belongs on the
-            // reader, so a fresh connection is the moment to make that true.
-            // Reader against app, plus positions -- NOT a Calibre refresh first:
-            // that is the phone's business with the server and never needed the
-            // reader to wait for it.
-            requestSync(positions = true)
-            refreshCatalogueIfStale()
-            checkFirmwareOnConnect()
-            resumeInterruptedFirmware()
+            onAuthorized(silent)
         } else {
             _state.value = _state.value.copy(
                 authorized = false,
-                pairing = PairingState.UNPAIRED,
+                authTrace = ble.lastAuthTrace,
                 link = LinkStatus(
-                    LinkStage.NEEDS_CODE,
-                    reason = "The reader forgot this phone",
-                    hint = "Enter its code to pair again.",
+                    LinkStage.FAILED,
+                    reason = "Authorisation failed",
+                    hint = "Forget pairing, then pair again",
                 ),
             )
         }
@@ -685,15 +636,136 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Pairs with a reader whose Settings screen is open (security v2).
+     *
+     * Scans by service UUID, connects, bonds (Android's dialog takes the passkey
+     * the reader shows), sends `pair` only on a bonded link while the reader's
+     * pairing window is open, then a hello. The pairing -- identity, the reader's
+     * device_id and Bluetooth address -- is stored only once reader_proof verifies.
+     */
+    fun pairReader(): Job {
+        connectJob?.takeIf { it.isActive }?.let { return it }
+        return viewModelScope.launch {
+        if (!linkPreflight()) return@launch
+        if (pairingStore.load() != null) {
+            _state.value = _state.value.copy(message = "Forget the current pairing first")
+            return@launch
+        }
+        _state.value = _state.value.copy(
+            permissionsGranted = true,
+            message = null,
+            link = LinkStatus(LinkStage.SCANNING),
+        )
+
+        val status = runCatching { ble.connect(address = null, allowBond = true) }.getOrElse { e ->
+            failLink(e, silent = false)
+            return@launch
+        }
+        val address = ble.connectedAddress()
+        val deviceId = status.deviceId
+        if (address == null || deviceId == null) {
+            ble.disconnect()
+            failLink(
+                BleClient.BleException("The reader did not identify itself", reason = BleClient.Reason.NOT_A_READER),
+                silent = false,
+            )
+            return@launch
+        }
+        if (!status.pairingWindow) {
+            ble.disconnect()
+            _state.value = _state.value.copy(
+                link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_HINT),
+            )
+            return@launch
+        }
+
+        _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
+        val identity = pairingStore.mint().copy(deviceId = deviceId, address = address)
+        runCatching { ble.pair(identity) }.exceptionOrNull()?.let { e ->
+            ble.disconnect()
+            failLink(e, silent = false)
+            return@launch
+        }
+        val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
+        if (!ok) {
+            ble.disconnect()
+            _state.value = _state.value.copy(
+                authorized = false,
+                authTrace = ble.lastAuthTrace,
+                link = LinkStatus(LinkStage.FAILED, reason = "Pairing failed", hint = PAIR_HINT),
+                message = "Pairing failed",
+            )
+            return@launch
+        }
+
+        pairingStore.save(identity)
+        _state.value = _state.value.copy(hasStoredPairing = true, storedHostId = identity.hostId)
+        ReaderPresence.register(getApplication())
+        onAuthorized(silent = true)
+        _state.value = _state.value.copy(message = "Paired")
+        }.also { connectJob = it }
+    }
+
+    /** Permission and radio checks before any scan. False when the link cannot start. */
+    private fun linkPreflight(): Boolean {
+        if (!BlePermissions.granted(getApplication())) {
+            _state.value = _state.value.copy(
+                permissionsGranted = false,
+                link = LinkStatus(
+                    LinkStage.NEEDS_PERMISSION,
+                    reason = "Bluetooth permission is not granted",
+                    hint = BlePermissions.denialMessage,
+                ),
+            )
+            return false
+        }
+        if (!ble.bluetoothEnabled()) {
+            _state.value = _state.value.copy(
+                link = LinkStatus(
+                    LinkStage.BLUETOOTH_OFF,
+                    reason = "Bluetooth is off",
+                    hint = "Turn Bluetooth on, then connect.",
+                ),
+            )
+            return false
+        }
+        return true
+    }
+
+    /** A session whose reader_proof verified: mark it and start what a connection does. */
+    private fun onAuthorized(silent: Boolean) {
+        linkFailStreak = 0
+        _state.value = _state.value.copy(
+            authorized = true,
+            pairing = PairingState.TRUSTED,
+            link = LinkStatus(LinkStage.CONNECTED),
+            authTrace = ble.lastAuthTrace,
+            message = if (silent) null
+            else "Connected to ${_state.value.deviceName.ifBlank { "the reader" }}",
+        )
+        viewModelScope.launch {
+            // The reader has no clock of its own worth trusting; tell it the
+            // time and the zone before anything else uses a timestamp.
+            runCatching { ble.setDeviceTime() }
+            // The shelf is the contract: whatever is saved offline belongs on the
+            // reader, so a fresh connection is the moment to make that true.
+            requestSync(positions = true)
+            refreshCatalogueIfStale()
+            checkFirmwareOnConnect()
+            resumeInterruptedFirmware()
+        }
+    }
+
+    /**
      * Turns a connection failure into a stage plus something to do about it.
      *
      * Each case is genuinely different: an off radio needs the user's settings,
-     * a missing reader needs its Transfer screen opened, a wrong device needs a
-     * different device. Collapsing them into "could not connect" is what makes
-     * a first run feel broken.
+     * a missing reader needs waking, a wrong device needs a different device.
+     * Collapsing them into "could not connect" is what makes a first run feel broken.
      */
     private fun failLink(e: Throwable, silent: Boolean) {
         val reason = (e as? BleClient.BleException)?.reason ?: BleClient.Reason.OTHER
+        val repairHint = if (_state.value.hasStoredPairing) "Forget pairing, then pair again" else PAIR_HINT
         val baseStatus = when (reason) {
             BleClient.Reason.NO_ADAPTER -> LinkStatus(
                 LinkStage.FAILED,
@@ -720,10 +792,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 "That device is not a CrossPoint reader",
                 "Move closer to the reader and retry.",
             )
-            BleClient.Reason.AUTH -> LinkStatus(
-                LinkStage.NEEDS_CODE,
-                e.message ?: "The reader refused this phone",
-                "Enter the code shown on the reader.",
+            BleClient.Reason.AUTH ->
+                if ((e as? BleClient.BleException)?.code == "pairing window closed") {
+                    LinkStatus(LinkStage.NEEDS_PAIRING, "Pairing is closed on the reader", PAIR_HINT)
+                } else {
+                    LinkStatus(LinkStage.FAILED, e.message ?: "The reader refused this phone", repairHint)
+                }
+            BleClient.Reason.BOND -> LinkStatus(
+                LinkStage.FAILED,
+                e.message ?: "Pairing did not finish",
+                repairHint,
+            )
+            BleClient.Reason.OLD_FIRMWARE -> LinkStatus(
+                LinkStage.FAILED,
+                "Update the reader firmware",
+                "",
             )
             else -> LinkStatus(
                 LinkStage.FAILED,
@@ -746,59 +829,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(
             link = status,
             authorized = false,
+            authTrace = ble.lastAuthTrace,
             message = if (silent) null else status.reason,
         )
-    }
-
-    /**
-     * First-time authorisation with the six-digit code.
-     *
-     * The reader does **not** save the trusted host at this point. Its firmware
-     * refuses `save_host` outright until an authenticated upload has completed
-     * ("save_host requires completed upload"), and only then prompts on its own
-     * screen. So this stores the identity as "code authorised" and it is
-     * promoted to trusted when the reader confirms — which is why the UI says
-     * "authorised for now" rather than "paired" until a book has actually gone
-     * across.
-     */
-    fun submitPairingCode(code: String) = viewModelScope.launch {
-        if (!Regex("^\\d{6}$").matches(code)) {
-            _state.value = _state.value.copy(message = "The code is six digits")
-            return@launch
-        }
-        _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
-        val identity = pairingStore.load() ?: pairingStore.mint()
-        val outcome = runCatching { ble.helloWithCode(code, identity) }
-        outcome.onSuccess { status ->
-            _state.value = _state.value.copy(hasStoredPairing = true)
-            pairingStore.save(
-                identity.copy(
-                    deviceId = status.deviceId ?: identity.deviceId,
-                    trusted = status.paired || status.trustedHost,
-                )
-            )
-            _state.value = _state.value.copy(
-                authorized = true,
-                pairing = if (status.paired) PairingState.TRUSTED else PairingState.CODE_AUTHORIZED,
-                link = LinkStatus(LinkStage.CONNECTED),
-                message = if (status.paired) "Paired with the reader"
-                else "Connected with the code",
-            )
-            refresh()
-        }.onFailure { e ->
-            val wrongCode = (e as? BleClient.BleException)?.code == "invalid session code"
-            _state.value = _state.value.copy(
-                authorized = false,
-                link = LinkStatus(
-                    LinkStage.NEEDS_CODE,
-                    reason = if (wrongCode) "That code was not accepted"
-                    else e.message ?: "The reader rejected that code",
-                    hint = if (wrongCode) "Check the code on the reader and try again."
-                    else "Make sure the reader is awake.",
-                ),
-                message = e.message ?: "The reader rejected that code",
-            )
-        }
     }
 
     fun disconnectReader() = viewModelScope.launch {
@@ -811,16 +844,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /**
+     * Clears the stored pairing. The Android bond stays: removing it takes a
+     * hidden API, so the UI opens Bluetooth settings for the user to remove it.
+     */
     fun forgetPairing() = viewModelScope.launch {
         pairingStore.clear()
         ReaderPresence.unregister(getApplication())
-        _state.value = _state.value.copy(hasStoredPairing = false)
         ble.disconnect()
         _state.value = _state.value.copy(
+            hasStoredPairing = false,
+            storedHostId = null,
             authorized = false,
             pairing = PairingState.UNPAIRED,
             link = LinkStatus(LinkStage.IDLE),
-            message = "Forgot this pairing",
+            message = "Now remove the reader in Bluetooth settings",
         )
     }
 
@@ -870,7 +908,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun syncProgressToKosync() = viewModelScope.launch {
         val c = _state.value.config
-        if (c.username.isBlank() || c.serverUrl.isBlank()) {
+        if (c.username.isBlank() || !c.serverConfigured) {
             _state.value = _state.value.copy(message = "Set the server account first")
             return@launch
         }
@@ -1144,13 +1182,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         loadLibrary()
     }
 
-    private suspend fun promoteToTrusted(deviceId: String?) {
-        val current = pairingStore.load() ?: return
-        if (current.trusted && (deviceId == null || current.deviceId == deviceId)) return
-        pairingStore.save(current.copy(deviceId = deviceId ?: current.deviceId, trusted = true))
-        _state.value = _state.value.copy(pairing = PairingState.TRUSTED)
-    }
-
     // ---------------------------------------------------------------- store
 
     /**
@@ -1160,7 +1191,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun storeContext(): StoreContext? {
         val c = _state.value.config
-        if (c.serverUrl.isBlank()) return null
+        if (!c.serverConfigured) return null
         return StoreContext(
             opds = OpdsClient(http, c.opdsUrl, c.username, c.password),
             baseUrl = c.opdsUrl,
@@ -1220,11 +1251,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun refresh() = viewModelScope.launch {
         val c = _state.value.config
-        if (c.serverUrl.isBlank()) {
+        if (!c.serverConfigured) {
             // Not configured: nothing to load. Never covers a message already showing.
             _state.value = _state.value.copy(
                 loading = false,
-                message = _state.value.message ?: "Set the server URL in Settings",
+                message = _state.value.message
+                    ?: if (c.serverUrl.isBlank()) "Set the server URL in Settings" else HTTPS_REQUIRED,
             )
             return@launch
         }
@@ -1317,8 +1349,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             refresh()
             return@launch
         }
-        if (c.serverUrl.isBlank()) {
-            _state.value = _state.value.copy(message = "Set the server URL in Settings")
+        if (!c.serverConfigured) {
+            _state.value = _state.value.copy(
+                message = if (c.serverUrl.isBlank()) "Set the server URL in Settings" else HTTPS_REQUIRED,
+            )
             return@launch
         }
         _state.value = _state.value.copy(searching = true, message = null)
@@ -1384,7 +1418,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Books whose local copy is only still here so the row can say it is
         // waiting on the reader. See PendingRemovalStore.
         val owed = pendingRemovals.load(deviceKey())
-        val canSync = c.username.isNotBlank() && c.serverUrl.isNotBlank() && withProgress
+        val canSync = c.username.isNotBlank() && c.serverConfigured && withProgress
         val kosync = KosyncClient(http, c.kosyncUrl, c.username, c.password)
         val known = _state.value.library.associate { it.book.filename to it.progress }
 
@@ -1669,7 +1703,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         heartbeatWriting = true
         try {
             val c = _state.value.config
-            if (c.username.isBlank() || c.serverUrl.isBlank()) {
+            if (c.username.isBlank() || !c.serverConfigured) {
                 heartbeatPending.clear()
                 return
             }
@@ -1806,6 +1840,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun updateFromCalibre(changed: List<Book>) {
         val c = _state.value.config
+        if (!c.serverConfigured) return
         val kosync = KosyncClient(http, c.kosyncUrl, c.username, c.password)
         val canSync = c.username.isNotBlank()
         var updated = 0
@@ -2405,7 +2440,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 bookOpenDeferredAt = 0L
                 // On the reader now: the row goes back to full colour.
                 markPendingTransfer(row.book.id, false)
-                if (r.pairedNow) promoteToTrusted(deviceId)
                 val secs = (r.elapsedMs / 1000.0).coerceAtLeast(0.1)
                 "Sent \"${row.book.title}\" — ${r.bytes / 1024} KB in ${secs.toInt()}s " +
                     "(${(r.bytes / secs / 1024).toInt()} KB/s)"
@@ -2473,51 +2507,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Stages a firmware image on the reader's SD card.
-     *
-     * This does **not** flash anything. The reader's firmware push is a file
-     * drop: on commit it validates the image, writes `/firmware/firmware.bin`
-     * and — from the digest it just verified itself — `firmware.bin.sha256`
-     * beside it, and stops. A watcher on the device re-hashes the image off the
-     * card on its own clock and asks the user, on the device, whether to
-     * install. So the honest report here is "staged", never "updated".
-     *
-     * The hash file is deliberately not sent from this app. The reader writes it
-     * from the digest it verified during the transfer, which is the only digest
-     * that can be trusted to describe the bytes that actually landed.
+     * Stages a downloaded, signed image on the reader and reports what the reader
+     * made of it. Nothing is flashed here: the reader checks the SHA-256, that the
+     * version is newer and the signature, then asks whether to install.
      */
-    fun sendFirmware(uri: Uri, displayName: String) = viewModelScope.launch {
-        val kinds = _state.value.device?.uploadKinds.orEmpty()
-        if (kinds.isNotEmpty() && "firmware" !in kinds) {
-            _state.value = _state.value.copy(message = "This reader does not accept firmware over Bluetooth")
-            return@launch
-        }
-
-        // Copied out of the content URI first: the upload streams the file more
-        // than once (once to hash, once to send) and a SAF stream is not
-        // guaranteed to be re-openable.
-        val staged = runCatching {
-            withContext(Dispatchers.IO) {
-                val out = File(getApplication<Application>().cacheDir, "firmware-upload.bin")
-                getApplication<Application>().contentResolver.openInputStream(uri).use { input ->
-                    if (input == null) throw IllegalStateException("no stream for $displayName")
-                    out.outputStream().use { input.copyTo(it) }
-                }
-                out
-            }
-        }.getOrElse {
-            _state.value = _state.value.copy(message = "Could not read $displayName: ${it.message}")
-            return@launch
-        }
-
-        uploadFirmware(staged, displayName)
-    }
-
-    /**
-     * Sends an image already on this phone, and reports what the reader made of it.
-     * Shared by the file picker and the update-page install.
-     */
-    private suspend fun uploadFirmware(staged: File, displayName: String, version: String? = null) {
+    private suspend fun uploadFirmware(staged: File, displayName: String, version: String?, signature: String?) {
         if (version != null) {
             resumeFirmwareVersion = version
             _state.value = _state.value.copy(firmwareProgress = FirmwareProgress(version, FirmwarePhase.SENDING))
@@ -2526,7 +2520,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         var lastShown = 0L
         var firstByteAt = 0L
         val outcome = runCatching {
-            ble.upload(staged, name = "firmware.bin", kind = "firmware", version = version) { sent, total ->
+            ble.upload(staged, name = "firmware.bin", kind = "firmware", version = version, signature = signature) { sent, total ->
                 if (firstByteAt == 0L) firstByteAt = System.currentTimeMillis()
                 if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
                     lastShown = sent
@@ -2636,8 +2630,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             readerFirmware = running,
             readerFirmwareTooOld = tooOld,
             latestFirmware = latest,
-            firmwareCheckNote = if (base.isBlank()) "Set an update URL in Settings"
-            else m?.exceptionOrNull()?.let { "Could not reach the update page ($base)" },
+            firmwareCheckNote = if (base.isBlank()) HTTPS_REQUIRED
+            else m?.exceptionOrNull()?.let { e ->
+                // "Unsigned firmware" / "malformed firmware.json" say more than "unreachable".
+                if (e is IllegalArgumentException) e.message else "Could not reach the update page ($base)"
+            },
             // Stamps are yyyyMMdd.HHmm, so string order is build order.
             firmwareUpdateAvailable = latest != null && (running?.let { it < latest.version } ?: tooOld),
             readerUpdateStaged = staged,
@@ -2766,7 +2763,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val m = runCatching { withContext(Dispatchers.IO) { fetchManifest(base) } }.getOrElse {
             _state.value = _state.value.copy(
                 firmwareProgress = null,
-                message = "Could not reach the update page ($base)",
+                message = if (it is IllegalArgumentException) it.message else "Could not reach the update page ($base)",
             )
             return@launch
         }
@@ -2791,6 +2788,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             withContext(Dispatchers.IO) {
                 http.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { r ->
                     if (!r.isSuccessful) error("HTTP ${r.code}")
+                    // Never more than the manifest says, and never over 8 MB.
+                    val cap = minOf(m.size, HttpGuard.FIRMWARE_MAX)
+                    HttpGuard.checkDeclared(r, cap, "Firmware image")
                     val digest = java.security.MessageDigest.getInstance("SHA-256")
                     var total = 0L
                     var shown = 0L
@@ -2800,9 +2800,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             while (true) {
                                 val n = input.read(buf)
                                 if (n <= 0) break
+                                total += n
+                                if (total > cap) throw HttpGuard.TooLarge("Firmware image")
                                 out.write(buf, 0, n)
                                 digest.update(buf, 0, n)
-                                total += n
                                 if (total - shown >= PROGRESS_STEP_BYTES) {
                                     shown = total
                                     withContext(Dispatchers.Main) {
@@ -2817,6 +2818,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         }
                     }
+                    if (total != m.size) error("the download is $total bytes, not ${m.size}")
                     val hex = digest.digest().joinToString("") { "%02x".format(it) }
                     if (!hex.equals(m.sha256, ignoreCase = true)) {
                         error("the download does not match its published SHA-256")
@@ -2840,13 +2842,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             firmwareProgress = FirmwareProgress(m.version, FirmwarePhase.SENDING),
         )
         syncJob?.join()
-        uploadFirmware(target, label, m.version)
+        uploadFirmware(target, label, m.version, m.signature)
     }
 
     private fun fetchManifest(base: String): FirmwareManifest =
         http.newCall(okhttp3.Request.Builder().url("$base/firmware.json").build()).execute().use { r ->
             if (!r.isSuccessful) error("HTTP ${r.code}")
-            FirmwareManifest.parse(r.body!!.string())
+            FirmwareManifest.parse(HttpGuard.string(r, HttpGuard.MANIFEST_MAX, "firmware.json"))
         }
 
     private var firmwareWatchJob: Job? = null
@@ -3141,7 +3143,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * calibreQueue, exactly as a manual refresh does.
      */
     private fun refreshCatalogueIfStale() {
-        if (_state.value.config.serverUrl.isBlank()) return
+        if (!_state.value.config.serverConfigured) return
         if (System.currentTimeMillis() - lastCatalogueAt >= CATALOGUE_STALE_MS) refresh()
     }
 
@@ -3151,21 +3153,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val identity = pairingStore.load() ?: return@launch
-                val ok = runCatching { ble.authenticateTrusted(identity) }.getOrDefault(false)
-                if (ok) {
-                    linkFailStreak = 0
-                    promoteToTrusted(_state.value.device?.deviceId)
-                    _state.value = _state.value.copy(
-                        authorized = true,
-                        pairing = PairingState.TRUSTED,
-                        link = LinkStatus(LinkStage.CONNECTED),
-                    )
-                    runCatching { ble.setDeviceTime() }
-                    requestSync(positions = true)
-                    refreshCatalogueIfStale()
-                    checkFirmwareOnConnect()
-                    resumeInterruptedFirmware()
-                }
+                val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
+                if (ok) onAuthorized(silent = true)
             } finally {
                 reauthInFlight = false
                 _state.value = _state.value.copy(authTrace = ble.lastAuthTrace)

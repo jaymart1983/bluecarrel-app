@@ -39,10 +39,15 @@ class KosyncClient(
     private val pass: String,
 ) {
 
-    private fun builder(path: String) = Request.Builder()
-        .url(baseUrl.trimEnd('/') + path)
-        .header("Authorization", Credentials.basic(user, pass))
-        .header("Accept", "application/vnd.koreader.v1+json")
+    private fun builder(path: String): Request.Builder {
+        val url = baseUrl.trimEnd('/') + path
+        val b = Request.Builder()
+            .url(url)
+            .header("Accept", "application/vnd.koreader.v1+json")
+        // Only to the configured server over https, never anywhere else.
+        if (HttpGuard.sameOrigin(url, baseUrl)) b.header("Authorization", Credentials.basic(user, pass))
+        return b
+    }
 
     suspend fun authenticates(): Boolean = withContext(Dispatchers.IO) {
         runCatching {
@@ -62,7 +67,7 @@ class KosyncClient(
             http.newCall(builder("/syncs/progress/$documentHash").get().build())
                 .execute().use { resp ->
                     if (!resp.isSuccessful) return@use null
-                    val body = resp.body?.string().orEmpty()
+                    val body = HttpGuard.string(resp, HttpGuard.KOSYNC_MAX, "kosync response")
                     if (body.isBlank()) return@use null
                     val json = JSONObject(body)
                     val doc = json.optString("document")

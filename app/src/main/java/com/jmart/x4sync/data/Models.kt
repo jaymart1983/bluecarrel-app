@@ -188,27 +188,24 @@ data class BookRow(
     val pendingRemoval: Boolean = false,
 )
 
-/** Persistent identity this phone presents to the reader for trusted auth. */
+/** Identity this phone presents to the reader. Stored only after a verified pairing. */
 data class HostIdentity(
     val hostId: String,
     val hostName: String,
-    /** 64 hex chars. Used as the literal ASCII HMAC key, not decoded first. */
+    /** 64 lowercase hex chars. The HMAC key is the 32 bytes it decodes to. */
     val secret: String,
-    /** Which reader this identity was established with, if known. */
+    /** The reader's device_id at pairing. A reader reporting another id is a different reader. */
     val deviceId: String? = null,
-    /** True once the reader confirmed it saved us as a trusted host. */
-    val trusted: Boolean = false,
+    /** The reader's Bluetooth address at pairing. Scans and connects go only to it. */
+    val address: String? = null,
 )
 
 /** Where this app stands with the reader, for the UI. */
 enum class PairingState {
-    /** No identity stored: the six-digit code is required. */
+    /** No pairing stored. */
     UNPAIRED,
 
-    /** Identity stored but not yet confirmed saved on the reader. */
-    CODE_AUTHORIZED,
-
-    /** Reconnected silently over HMAC, or the reader confirmed the save. */
+    /** Paired: identity, reader id and address stored. */
     TRUSTED,
 }
 
@@ -237,10 +234,13 @@ enum class LinkStage {
     /** Found something; opening GATT, negotiating MTU, discovering services. */
     CONNECTING,
 
-    /** Connected. The reader wants the six-digit code from its screen. */
-    NEEDS_CODE,
+    /** Not paired. The user opens Settings on the reader, then taps Pair. */
+    NEEDS_PAIRING,
 
-    /** A `hello` is in flight — either the code or the trusted-host HMAC. */
+    /** Android is bonding; its system dialog takes the passkey the reader shows. */
+    BONDING,
+
+    /** A `pair` or `hello` is in flight. */
     PAIRING,
 
     /** Connected and authorised. */
@@ -265,7 +265,7 @@ data class LinkStatus(
 ) {
     val busy: Boolean
         get() = stage == LinkStage.SCANNING || stage == LinkStage.CONNECTING ||
-            stage == LinkStage.PAIRING
+            stage == LinkStage.PAIRING || stage == LinkStage.BONDING
 }
 
 /**
@@ -395,12 +395,18 @@ data class DeviceStatus(
     val sleeping: Boolean,
     /** A book is open on the reader right now ([bookFilename] names it). Older firmware never says. */
     val bookOpen: Boolean = false,
+    /** The reader's Settings screen is open and will take a new bond and `pair`. */
+    val pairingWindow: Boolean = false,
+    /** HMAC the reader returns after a hello. Checked by BleClient, never read as a flag. */
+    val readerProof: String? = null,
+    /** Why the reader refused a hello or pair. */
+    val authError: String? = null,
     val raw: String,
 ) {
     /** Both halves of the fingerprint, or null when the reader did not send one. */
     val libraryFingerprint: Pair<Int, Long>?
         get() = libraryBooks?.let { n -> libraryHash?.let { h -> n to h } }
-    /** The reader named a trusted host on this status: silent auth succeeded. */
+    /** The reader named a trusted host. Not proof of authentication on its own. */
     val trustedHost: Boolean get() = !trustedHostName.isNullOrBlank()
 
     companion object {
@@ -435,6 +441,9 @@ data class DeviceStatus(
                 bookFilename = j.optStringOrNull("book"),
                 sleeping = j.optBoolean("sleeping", false),
                 bookOpen = j.optBoolean("open", false),
+                pairingWindow = j.optBoolean("pairing_window", false),
+                readerProof = j.optStringOrNull("reader_proof"),
+                authError = j.optStringOrNull("auth_error"),
                 raw = json,
             )
         }.getOrNull()
@@ -459,12 +468,34 @@ data class DeviceStatus(
  * build stamp the firmware reports through its `about` download, so the two
  * compare directly; stamps are yyyyMMdd.HHmm and so also sort.
  */
-data class FirmwareManifest(val version: String, val file: String, val size: Long, val sha256: String) {
+data class FirmwareManifest(
+    val version: String,
+    val file: String,
+    val size: Long,
+    val sha256: String,
+    /** DER ECDSA P-256 signature over "X4FW1|version|sha256", lowercase hex. Passed to the reader. */
+    val signature: String,
+) {
     companion object {
         fun parse(json: String): FirmwareManifest {
             val j = org.json.JSONObject(json)
-            val m = FirmwareManifest(j.getString("version"), j.getString("file"), j.getLong("size"), j.getString("sha256"))
-            require(m.file.matches(Regex("[A-Za-z0-9._-]+\\.bin")) && m.sha256.length == 64 && m.size > 0) {
+            val signature = j.optString("signature", "").trim().lowercase()
+            require(signature.isNotEmpty()) { "Unsigned firmware" }
+            val m = FirmwareManifest(
+                j.getString("version"),
+                j.getString("file"),
+                j.getLong("size"),
+                j.getString("sha256").lowercase(),
+                signature,
+            )
+            require(
+                m.version.matches(Regex("\\d{8}\\.\\d{4}")) &&
+                    m.file.matches(Regex("[A-Za-z0-9._-]+\\.bin")) &&
+                    m.sha256.matches(Regex("[0-9a-f]{64}")) &&
+                    m.size > 0 && m.size <= HttpGuard.FIRMWARE_MAX &&
+                    m.signature.length <= 256 && m.signature.length % 2 == 0 &&
+                    m.signature.matches(Regex("[0-9a-f]+"))
+            ) {
                 "malformed firmware.json"
             }
             return m

@@ -58,6 +58,9 @@ import com.jmart.x4sync.data.Config
 import com.jmart.x4sync.data.CoverCache
 import com.jmart.x4sync.data.LinkStage
 import com.jmart.x4sync.data.PairingState
+import com.jmart.x4sync.data.DEFAULT_UPDATES_URL
+import com.jmart.x4sync.data.HTTPS_REQUIRED
+import com.jmart.x4sync.data.HttpGuard
 import android.content.Intent
 import android.graphics.Bitmap
 import android.provider.Settings
@@ -85,7 +88,7 @@ fun AppScaffold(vm: MainViewModel) {
     var settingsSection by remember { mutableStateOf<SettingsSection?>(null) }
     var overflowOpen by remember { mutableStateOf(false) }
     var showDeviceSettings by remember { mutableStateOf(false) }
-    var showCodeEntry by remember { mutableStateOf(false) }
+    var showPairing by remember { mutableStateOf(false) }
     /** The book whose detail sheet is open, if any. Held by filename because
      *  the row object is replaced whenever the shelf or the catalogue reloads. */
     var detailOf by remember { mutableStateOf<String?>(null) }
@@ -98,19 +101,12 @@ fun AppScaffold(vm: MainViewModel) {
         }
     }
 
-    // Raised only on a DELIBERATE verdict, and always dismissed on success.
-    //
-    // Not `connected && !authorized`: that is true during the normal handshake
-    // -- the transport is up while the hello is still in flight -- so the dialog
-    // would appear over a session that is about to authenticate.
-    //
-    // LinkStage.NEEDS_CODE is set by the ViewModel only when the code is really
-    // the next step: no stored identity, a different reader, or an authentication
-    // that actually failed.
+    // Raised when the ViewModel says pairing is the next step (NEEDS_PAIRING),
+    // and dismissed once the session is authorised.
     LaunchedEffect(state.authorized, state.link.stage) {
         when {
-            state.authorized -> showCodeEntry = false
-            state.link.stage == LinkStage.NEEDS_CODE -> showCodeEntry = true
+            state.authorized -> showPairing = false
+            state.link.stage == LinkStage.NEEDS_PAIRING -> showPairing = true
             else -> Unit
         }
     }
@@ -124,6 +120,7 @@ fun AppScaffold(vm: MainViewModel) {
                     ReaderStatusAction(
                         state = state,
                         onConnect = { vm.connectReader() },
+                        onPair = { showPairing = true },
                         onDisconnect = { vm.disconnectReader() },
                         onDeviceSettings = { showDeviceSettings = true },
                         onFirmware = { settingsSection = SettingsSection.FIRMWARE },
@@ -266,9 +263,8 @@ fun AppScaffold(vm: MainViewModel) {
             onDismiss = { settingsSection = null },
             onSave = { vm.saveConfig(it); settingsSection = null },
             onForgetPairing = { vm.forgetPairing() },
-            onEnterCode = { settingsSection = null; showCodeEntry = true },
+            onPair = { settingsSection = null; showPairing = true },
             onCrashReport = { vm.fetchCrashReport(); settingsSection = null },
-            onSendFirmware = { uri, name -> vm.sendFirmware(uri, name); settingsSection = null },
             onCheckFirmware = { vm.checkFirmware() },
             onInstallFirmware = { vm.installLatestFirmware(); settingsSection = null },
         )
@@ -345,11 +341,11 @@ fun AppScaffold(vm: MainViewModel) {
         LaunchedEffect(detailOf) { detailOf = null }
     }
 
-    if (showCodeEntry) {
-        CodeDialog(
-            hint = state.link.hint,
-            onDismiss = { showCodeEntry = false },
-            onSubmit = { vm.submitPairingCode(it); showCodeEntry = false },
+    if (showPairing) {
+        PairDialog(
+            reason = state.link.reason.takeIf { state.link.stage == LinkStage.NEEDS_PAIRING },
+            onDismiss = { showPairing = false },
+            onPair = { vm.pairReader(); showPairing = false },
         )
     }
 
@@ -403,11 +399,8 @@ private fun ResumeDialog(
  * which is true almost all the time.
  *
  * Every stage gets its own headline, its own line of what-to-do and its own
- * action — turn Bluetooth on, grant a permission, open the Transfer screen on
- * the reader, type a code, wait. "Enter pairing code" is offered in *every*
- * state rather than only under `NEEDS_CODE`, because it is the one recovery
- * path when pairing goes wrong and a user who cannot reach it is stuck.
- * (`NEEDS_CODE` still raises the dialog on its own, from AppScaffold.)
+ * action — turn Bluetooth on, grant a permission, pair, wait. While unpaired
+ * the menu offers Pair; `NEEDS_PAIRING` also raises the dialog from AppScaffold.
  *
  * Green means connected AND authorised. The transport being up is not the same
  * thing as being able to use the reader — a link through the hello gate is the
@@ -418,6 +411,7 @@ private fun ResumeDialog(
 private fun ReaderStatusAction(
     state: UiState,
     onConnect: () -> Unit,
+    onPair: () -> Unit,
     onDisconnect: () -> Unit,
     onDeviceSettings: () -> Unit,
     onFirmware: () -> Unit,
@@ -436,7 +430,7 @@ private fun ReaderStatusAction(
     // Something on the reader's own screen is waiting for the user, or the code
     // is. Neither survives being merely grey in a corner, so the icon carries a
     // dot -- the one thing the banner did that a plain icon cannot.
-    val wantsAttention = state.awaitingSaveHostPrompt || stage == LinkStage.NEEDS_CODE
+    val wantsAttention = state.awaitingSaveHostPrompt || stage == LinkStage.NEEDS_PAIRING
     // A newer build on the update page. Its own mark rather than the attention
     // dot: the dot means "the reader needs you now", this means "when convenient".
     val updateAvailable = state.firmwareUpdateAvailable
@@ -460,8 +454,9 @@ private fun ReaderStatusAction(
             (state.device?.firmwareName ?: "Reader") + " connected"
         stage == LinkStage.SCANNING -> "Looking for the reader…"
         stage == LinkStage.CONNECTING -> "Connecting…"
+        stage == LinkStage.BONDING -> "Pairing…"
         stage == LinkStage.PAIRING -> "Authorising…"
-        stage == LinkStage.NEEDS_CODE -> state.link.reason ?: "Needs the six-digit code"
+        stage == LinkStage.NEEDS_PAIRING -> state.link.reason ?: "Not paired"
         stage == LinkStage.BLUETOOTH_OFF -> "Bluetooth is off"
         stage == LinkStage.NEEDS_PERMISSION -> "Bluetooth permission needed"
         stage == LinkStage.FAILED -> state.link.reason ?: "Could not reach the reader"
@@ -471,11 +466,8 @@ private fun ReaderStatusAction(
     // One short line, or nothing. The headline already says what state the link is in.
     val detail = when {
         state.awaitingSaveHostPrompt -> "Confirm on the reader"
-        stage == LinkStage.CONNECTED -> when (state.pairing) {
-            PairingState.TRUSTED -> ""
-            PairingState.CODE_AUTHORIZED -> "Not saved on the reader yet"
-            PairingState.UNPAIRED -> "This session only"
-        }
+        stage == LinkStage.CONNECTED -> ""
+        stage == LinkStage.BONDING -> state.link.hint ?: ""
         stage == LinkStage.SCANNING || stage == LinkStage.CONNECTING || stage == LinkStage.PAIRING -> ""
         stage == LinkStage.IDLE -> "Wake the reader to connect"
         else -> state.link.hint ?: "Wake the reader to connect"
@@ -582,6 +574,12 @@ private fun ReaderStatusAction(
                             )
                         }
                     },
+                )
+                !state.hasStoredPairing && !state.connected -> DropdownMenuItem(
+                    text = { Text("Pair") },
+                    enabled = !busy,
+                    leadingIcon = { Icon(Icons.Default.Lock, null) },
+                    onClick = { menuOpen = false; onPair() },
                 )
                 state.connected -> DropdownMenuItem(
                     text = { Text("Disconnect") },
@@ -839,51 +837,21 @@ private fun TransferBar(t: TransferProgress) {
 }
 
 @Composable
-private fun CodeDialog(hint: String?, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
-    var code by remember { mutableStateOf("") }
-    val focus = remember { FocusRequester() }
-
-    // The keyboard should be up the moment the dialog is: the user is reading
-    // six digits off a second screen and will lose their place otherwise.
-    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
-
+private fun PairDialog(reason: String?, onDismiss: () -> Unit, onPair: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.Lock, null) },
         title = { Text("Pair with the reader") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                reason?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
                 Text(
-                    hint ?: "Enter the code shown on the reader.",
+                    "On the reader, open Settings. Tap Pair, then enter the passkey it shows.",
                     style = MaterialTheme.typography.bodySmall,
-                )
-                OutlinedTextField(
-                    value = code,
-                    onValueChange = { v -> code = v.filter { it.isDigit() }.take(6) },
-                    label = { Text("Six-digit code") },
-                    singleLine = true,
-                    // NumberPassword rather than Number: it is the numeric pad
-                    // without the decimal point, sign or locale separators that
-                    // a six-digit code can never contain.
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.NumberPassword,
-                        imeAction = ImeAction.Done,
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = { if (code.length == 6) onSubmit(code) }
-                    ),
-                    textStyle = TextStyle(
-                        fontSize = 28.sp,
-                        letterSpacing = 10.sp,
-                        textAlign = TextAlign.Center,
-                    ),
-                    modifier = Modifier.fillMaxWidth().focusRequester(focus),
                 )
             }
         },
-        confirmButton = {
-            TextButton(onClick = { onSubmit(code) }, enabled = code.length == 6) { Text("Pair") }
-        },
+        confirmButton = { TextButton(onClick = onPair) { Text("Pair") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -1362,23 +1330,14 @@ private fun SettingsSheet(
     onDismiss: () -> Unit,
     onSave: (Config) -> Unit,
     onForgetPairing: () -> Unit,
-    onEnterCode: () -> Unit,
+    onPair: () -> Unit,
     onCrashReport: () -> Unit,
-    onSendFirmware: (Uri, String) -> Unit,
     onCheckFirmware: () -> Unit,
     onInstallFirmware: () -> Unit,
 ) {
     var c by remember { mutableStateOf(config) }
 
-    // OpenDocument rather than GetContent: a firmware image is picked from
-    // wherever the user downloaded it, and GetContent's providers do not
-    // reliably offer plain files. The MIME filter is deliberately wide --
-    // .bin is served as octet-stream by some providers and as nothing at all
-    // by others -- so the reader's own validation is what actually gates it.
     val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) onSendFirmware(uri, displayNameOf(context, uri))
-    }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -1392,11 +1351,11 @@ private fun SettingsSheet(
 
             when (section) {
                 SettingsSection.CALIBRE -> {
-                    Field("Server URL", c.serverUrl) { c = c.copy(serverUrl = it) }
+                    Field("Server URL", c.serverUrl, error = httpsError(c.serverUrl)) { c = c.copy(serverUrl = it) }
                     Field("Username", c.username) { c = c.copy(username = it) }
                     Field("Password", c.password, secret = true) { c = c.copy(password = it) }
                     Text(
-                        "Server address only, no path.",
+                        "https:// server address only, no path.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -1407,7 +1366,6 @@ private fun SettingsSheet(
                             append(
                                 when (state.pairing) {
                                     PairingState.TRUSTED -> "Paired"
-                                    PairingState.CODE_AUTHORIZED -> "Connected with the code"
                                     PairingState.UNPAIRED -> "Not paired"
                                 }
                             )
@@ -1426,20 +1384,25 @@ private fun SettingsSheet(
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    // Both halves of pairing in one place, so the operations that
-                    // undo and redo a pairing sit together.
-                    //
-                    // Never conditional: when pairing has failed this is the only
-                    // way back, and gating it on the state that caused the
-                    // failure is how a user ends up with no route at all.
+                    // Both halves of pairing in one place. Re-pairing is Forget, then Pair.
                     OutlinedButton(
-                        onClick = onEnterCode,
+                        onClick = onPair,
+                        enabled = !state.hasStoredPairing,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Enter pairing code") }
+                    ) { Text("Pair") }
                     OutlinedButton(
-                        onClick = onForgetPairing,
-                        // Stored secret, not session state -- see UiState.hasStoredPairing.
-                        enabled = state.hasStoredPairing || state.pairing != PairingState.UNPAIRED,
+                        onClick = {
+                            onForgetPairing()
+                            // No public API removes the Android bond; the user does it there.
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                        },
+                        // Stored pairing, not session state -- see UiState.hasStoredPairing.
+                        enabled = state.hasStoredPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Forget pairing") }
                 }
@@ -1450,16 +1413,20 @@ private fun SettingsSheet(
                             " (code " + com.jmart.x4sync.BuildConfig.VERSION_CODE + ")",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    Field("Update page", c.updatesUrl) { c = c.copy(updatesUrl = it) }
+                    Field("Update page", c.updatesUrl, error = httpsError(c.updatesUrl)) { c = c.copy(updatesUrl = it) }
                     Text(
-                        "App builds and firmware.json.",
+                        "App builds and firmware.json. Blank uses GitHub releases.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     OutlinedButton(
                         onClick = {
                             runCatching {
+                                // The default is a download folder; its release page is the one to open.
+                                val page = c.effectiveUpdatesUrl.let {
+                                    if (it == DEFAULT_UPDATES_URL) it.removeSuffix("download/") else it
+                                }
                                 context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(c.effectiveUpdatesUrl))
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(page))
                                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 )
                             }
@@ -1519,11 +1486,6 @@ private fun SettingsSheet(
                             }
                         )
                     }
-                    OutlinedButton(
-                        onClick = { picker.launch(arrayOf("*/*")) },
-                        enabled = linked && state.transfer == null,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Send a firmware file\u2026") }
                     Text(
                         "The reader asks to install now or when it sleeps.",
                         style = MaterialTheme.typography.bodySmall,
@@ -1570,7 +1532,7 @@ private fun SettingsSheet(
             // question of what it is going to save.
             if (section == SettingsSection.CALIBRE || section == SettingsSection.UPDATES) {
                 Spacer(Modifier.height(4.dp))
-                Button(onClick = { onSave(c) }, modifier = Modifier.fillMaxWidth()) {
+                Button(onClick = { onSave(c) }, enabled = c.urlProblem == null, modifier = Modifier.fillMaxWidth()) {
                     Text("Save")
                 }
             }
@@ -1579,31 +1541,38 @@ private fun SettingsSheet(
 }
 
 @Composable
-private fun Field(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
+private fun Field(
+    label: String,
+    value: String,
+    secret: Boolean = false,
+    error: String? = null,
+    onChange: (String) -> Unit,
+) {
     OutlinedTextField(
         value = value,
         onValueChange = onChange,
         label = { Text(label) },
         singleLine = true,
+        isError = error != null,
+        supportingText = if (error != null) {
+            { Text(error) }
+        } else null,
         visualTransformation = if (secret)
             androidx.compose.ui.text.input.PasswordVisualTransformation()
         else androidx.compose.ui.text.input.VisualTransformation.None,
+        // Password keyboard, autocorrect off: the keyboard does not learn the password.
+        keyboardOptions = if (secret) {
+            KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false)
+        } else {
+            KeyboardOptions.Default
+        },
         modifier = Modifier.fillMaxWidth(),
     )
 }
 
-/**
- * The provider's display name for a picked document, falling back to the last
- * path segment. Only used to label the transfer and the result message; the
- * reader always stores the image as `firmware.bin` whatever it was called here.
- */
-private fun displayNameOf(context: android.content.Context, uri: Uri): String {
-    val fromProvider = runCatching {
-        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { if (it.moveToFirst()) it.getString(0) else null }
-    }.getOrNull()
-    return fromProvider ?: uri.lastPathSegment?.substringAfterLast('/') ?: "firmware.bin"
-}
+/** [HTTPS_REQUIRED] for a filled-in URL that is not https, else null. */
+private fun httpsError(url: String): String? =
+    if (url.isNotBlank() && !HttpGuard.isHttps(url)) HTTPS_REQUIRED else null
 
 /**
  * Shown when nothing has been saved offline yet.
