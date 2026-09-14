@@ -10,13 +10,13 @@ nothing else.
 ## Test builds
 
 - **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.2-test)** (download the APK on your phone)
-- **[Firmware test release](https://github.com/jaymart1983/bluecarrel-firmware/releases/tag/x4pro-20260914.2052-test)**
+- **[Latest firmware release](https://github.com/jaymart1983/bluecarrel-firmware/releases/latest)**
 - [All app releases](https://github.com/jaymart1983/bluecarrel-app/releases)
 
-Update page for the Firmware setting (tap and hold to copy):
+Leave the update page blank in the app's settings to get the latest firmware release. Update page URL, if you set it by hand (tap and hold to copy):
 
 ```
-https://github.com/jaymart1983/bluecarrel-firmware/releases/download/x4pro-20260914.2052-test/
+https://github.com/jaymart1983/bluecarrel-firmware/releases/latest/download/
 ```
 
 The test builds use encrypted pairing and signed firmware, so install the firmware first, then the app, then pair from the reader's Settings page.
