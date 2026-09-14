@@ -1,4 +1,4 @@
-# X4 Pro Sync
+# Bluecarrel
 
 Android companion app for the **Xteink X4 Pro** running the CrossPoint X4 Pro
 firmware. It keeps the reader's library, reading positions and firmware in sync
@@ -6,6 +6,20 @@ with your own Calibre-Web Automated server, over Bluetooth.
 
 No DRM handling, no Xteink cloud. The app talks to your server and your reader,
 nothing else.
+
+## Test builds
+
+- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.0-test)** (download the APK on your phone)
+- **[Firmware test release](https://github.com/jaymart1983/bluecarrel-firmware/releases/tag/x4pro-20260914.1834-test)**
+- [All app releases](https://github.com/jaymart1983/bluecarrel-app/releases)
+
+Update page for the Firmware setting (tap and hold to copy):
+
+```
+https://github.com/jaymart1983/bluecarrel-firmware/releases/download/x4pro-20260914.1834-test/
+```
+
+The test builds use encrypted pairing and signed firmware, so install the firmware first, then the app, then pair from the reader's Settings page.
 
 ## What it does
 
@@ -36,7 +50,7 @@ nothing else.
 
 - Android 10 (API 29) or later with Bluetooth LE.
 - An Xteink X4 Pro running the CrossPoint X4 Pro firmware
-  ([`ble-x4pro` branch](https://github.com/jaymart1983/crosspoint-reader/tree/ble-x4pro)).
+  ([Bluecarrel firmware](https://github.com/jaymart1983/bluecarrel-firmware)).
 - A [Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
   server with OPDS and kosync enabled, reachable from the phone (LAN, VPN or a
   tunnel).
