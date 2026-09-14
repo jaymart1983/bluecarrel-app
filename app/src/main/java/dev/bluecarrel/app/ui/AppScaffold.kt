@@ -1391,19 +1391,11 @@ private fun SettingsSheet(
                         enabled = !state.hasStoredPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Pair") }
+                    // Always enabled: a half-finished pairing leaves no stored pairing
+                    // but an Android bond and a reader that remembers the phone.
+                    // forgetPairing() opens Bluetooth settings to remove the bond.
                     OutlinedButton(
-                        onClick = {
-                            onForgetPairing()
-                            // No public API removes the Android bond; the user does it there.
-                            runCatching {
-                                context.startActivity(
-                                    Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                )
-                            }
-                        },
-                        // Stored pairing, not session state -- see UiState.hasStoredPairing.
-                        enabled = state.hasStoredPairing,
+                        onClick = onForgetPairing,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Forget pairing") }
                 }
@@ -1513,6 +1505,7 @@ private fun SettingsSheet(
                             append("  removing=").append(
                                 state.removingBookIds.joinToString(",").ifBlank { "-" }
                             ).append('\n')
+                            append("reader auth_error=").append(state.lastAuthError ?: "-").append('\n')
                             append("last auth attempt:\n").append(state.authTrace)
                             append("\nstore:\n").append(state.storeTrace)
                         },

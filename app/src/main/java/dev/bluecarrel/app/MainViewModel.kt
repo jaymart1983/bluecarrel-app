@@ -1,7 +1,9 @@
 package dev.bluecarrel.app
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import dev.bluecarrel.app.sync.ReaderPresence
 import dev.bluecarrel.app.sync.ReaderSyncService
@@ -224,6 +226,8 @@ data class UiState(
     val hasStoredPairing: Boolean = false,
     /** Diagnostics for the pairing bug: what the last auth attempt actually did. */
     val authTrace: String = "no attempt yet",
+    /** The last auth_error the reader reported. Diagnostics. */
+    val lastAuthError: String? = null,
     val storedHostId: String? = null,
     /** Store diagnostics: what the app has seen and done about reader requests. */
     val storeTrace: String = "no request seen",
@@ -274,6 +278,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val FIRMWARE_INSTALL_TIMEOUT_MS = 15 * 60_000L
         /** What to do to pair: the reader opens its pairing window on its Settings screen. */
         const val PAIR_HINT = "On the reader, open Settings"
+        /** The reader's pairing window is closed. */
+        const val PAIR_CLOSED_HINT = "On the reader open Settings and tap Pair new phone. " +
+            "If no passkey appears, remove the reader in Bluetooth settings and try again."
+        /** The reader no longer knows this phone. */
+        const val FORGOTTEN_HINT = "Remove the reader in Bluetooth settings, then pair again"
+        /** Reader auth_error codes that mean it has no record of this phone. */
+        val FORGOTTEN_CODES = setOf("unknown trusted host", "invalid trusted host auth")
     }
 
     private val settings = SettingsStore(app)
@@ -412,6 +423,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     // open, so the last name is kept for as long as `open` holds.
                     readerOpenBook = if (s.bookOpen) s.bookFilename ?: _state.value.readerOpenBook else null,
                     authTrace = ble.lastAuthTrace,
+                    lastAuthError = ble.lastAuthError,
                     storeTrace = s.pending?.let { p ->
                         "saw req=${p.req} op=${p.op} off=${p.offset} lim=${p.limit} " +
                             "thumb=${p.thumbWidth}x${p.thumbHeight}"
@@ -621,10 +633,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
         if (ok) {
             onAuthorized(silent)
+        } else if (readerForgotPhone()) {
+            onReaderForgotPhone(silent)
         } else {
             _state.value = _state.value.copy(
                 authorized = false,
                 authTrace = ble.lastAuthTrace,
+                lastAuthError = ble.lastAuthError,
                 link = LinkStatus(
                     LinkStage.FAILED,
                     reason = "Authorisation failed",
@@ -633,6 +648,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         }.also { connectJob = it }
+    }
+
+    /**
+     * The last hello was refused because the reader has no record of this phone.
+     * Only the reader's explicit auth_error counts; link errors never do.
+     */
+    private fun readerForgotPhone(): Boolean = ble.lastAuthFailure?.let { it in FORGOTTEN_CODES } == true
+
+    /**
+     * The reader forgot this phone: the stored pairing is useless, so clear it
+     * and stop watching for the reader. The Android bond is left for the user.
+     */
+    private suspend fun onReaderForgotPhone(silent: Boolean) {
+        pairingStore.clear()
+        ReaderPresence.unregister(getApplication())
+        ble.disconnect()
+        val link = LinkStatus(LinkStage.NEEDS_PAIRING, "The reader forgot this phone", FORGOTTEN_HINT)
+        _state.value = _state.value.copy(
+            hasStoredPairing = false,
+            storedHostId = null,
+            authorized = false,
+            pairing = PairingState.UNPAIRED,
+            authTrace = ble.lastAuthTrace,
+            lastAuthError = ble.lastAuthError,
+            link = link,
+            message = if (silent) null else link.reason,
+        )
     }
 
     /**
@@ -674,13 +716,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!status.pairingWindow) {
             ble.disconnect()
             _state.value = _state.value.copy(
-                link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_HINT),
+                link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_CLOSED_HINT),
+                lastAuthError = ble.lastAuthError,
             )
             return@launch
         }
 
         _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
         val identity = pairingStore.mint().copy(deviceId = deviceId, address = address)
+        // pair() returns only when the reader confirmed paired == true; anything
+        // else throws, and no hello is sent after an unconfirmed pair.
         runCatching { ble.pair(identity) }.exceptionOrNull()?.let { e ->
             ble.disconnect()
             failLink(e, silent = false)
@@ -689,11 +734,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
         if (!ok) {
             ble.disconnect()
+            val why = ble.lastAuthFailure?.let { "Pairing failed: $it" } ?: "Pairing failed"
             _state.value = _state.value.copy(
                 authorized = false,
                 authTrace = ble.lastAuthTrace,
-                link = LinkStatus(LinkStage.FAILED, reason = "Pairing failed", hint = PAIR_HINT),
-                message = "Pairing failed",
+                lastAuthError = ble.lastAuthError,
+                link = LinkStatus(LinkStage.FAILED, reason = why, hint = PAIR_CLOSED_HINT),
+                message = why,
             )
             return@launch
         }
@@ -794,7 +841,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
             BleClient.Reason.AUTH ->
                 if ((e as? BleClient.BleException)?.code == "pairing window closed") {
-                    LinkStatus(LinkStage.NEEDS_PAIRING, "Pairing is closed on the reader", PAIR_HINT)
+                    LinkStatus(LinkStage.NEEDS_PAIRING, "Pairing is closed on the reader", PAIR_CLOSED_HINT)
                 } else {
                     LinkStatus(LinkStage.FAILED, e.message ?: "The reader refused this phone", repairHint)
                 }
@@ -830,6 +877,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             link = status,
             authorized = false,
             authTrace = ble.lastAuthTrace,
+            lastAuthError = ble.lastAuthError,
             message = if (silent) null else status.reason,
         )
     }
@@ -845,20 +893,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Clears the stored pairing. The Android bond stays: removing it takes a
-     * hidden API, so the UI opens Bluetooth settings for the user to remove it.
+     * Clears any stored pairing, stops watching for the reader, disconnects and
+     * opens Bluetooth settings. Works with or without a stored pairing: a pairing
+     * that failed halfway leaves nothing stored but an Android bond. The bond
+     * itself stays -- removing it takes a hidden API -- so the user removes it there.
      */
     fun forgetPairing() = viewModelScope.launch {
-        pairingStore.clear()
+        connectJob?.cancel()
+        runCatching {
+            getApplication<Application>().startActivity(
+                Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        runCatching { pairingStore.clear() }
         ReaderPresence.unregister(getApplication())
         ble.disconnect()
+        linkFailStreak = 0
         _state.value = _state.value.copy(
             hasStoredPairing = false,
             storedHostId = null,
             authorized = false,
             pairing = PairingState.UNPAIRED,
             link = LinkStatus(LinkStage.IDLE),
-            message = "Now remove the reader in Bluetooth settings",
+            message = "Remove the reader here, then pair again",
         )
     }
 
@@ -3155,9 +3212,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val identity = pairingStore.load() ?: return@launch
                 val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
                 if (ok) onAuthorized(silent = true)
+                else if (readerForgotPhone()) onReaderForgotPhone(silent = true)
             } finally {
                 reauthInFlight = false
-                _state.value = _state.value.copy(authTrace = ble.lastAuthTrace)
+                _state.value = _state.value.copy(authTrace = ble.lastAuthTrace, lastAuthError = ble.lastAuthError)
             }
         }
     }

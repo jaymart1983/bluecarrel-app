@@ -305,6 +305,16 @@ class BleClient(private val context: Context) {
     var lastAuthTrace: String = "no attempt yet"
         private set
 
+    /** The last auth_error the reader reported, from any status read or notification. */
+    @Volatile
+    var lastAuthError: String? = null
+        private set
+
+    /** Short reason the last pair or hello did not authorise; null after a success. */
+    @Volatile
+    var lastAuthFailure: String? = null
+        private set
+
     data class DataFrame(val sequence: Long, val payload: ByteArray) {
         override fun equals(other: Any?) = this === other
         override fun hashCode() = sequence.hashCode()
@@ -481,6 +491,7 @@ class BleClient(private val context: Context) {
 
     private fun publishStatus(raw: ByteArray) {
         val parsed = DeviceStatus.parse(String(raw, Charsets.UTF_8)) ?: return
+        parsed.authError?.let { lastAuthError = it }
         // A status can take authorisation away, never grant it: only a verified
         // reader_proof does that (authenticateLocked).
         if (parsed.state == "error" && isAuthError(parsed.error)) authorized = false
@@ -917,15 +928,30 @@ class BleClient(private val context: Context) {
      * Sent only on a connected link Android reports BOND_BONDED, and only while
      * the reader's status says `pairing_window`. The answer authorises nothing;
      * the caller follows with [authenticate], whose reader_proof does.
+     *
+     * Returns only when the reader confirms `paired == true`, in the awaited
+     * notification or a fresh read. Anything else throws.
      */
     @SuppressLint("MissingPermission")
     suspend fun pair(identity: HostIdentity): DeviceStatus = authLock.withLock {
-        val device = gatt?.device ?: throw BleException("Not connected", reason = Reason.LINK)
+        val trace = StringBuilder()
+        fun note(s: String) { trace.append(s).append('\n'); lastAuthTrace = trace.toString().trim() }
+        note("pair host=${identity.hostId.take(8)}…")
+        lastAuthFailure = null
+        val device = gatt?.device ?: run {
+            note("pair: not connected")
+            lastAuthFailure = "not connected"
+            throw BleException("Not connected", reason = Reason.LINK)
+        }
         if (_connection.value != BleConnection.CONNECTED || device.bondState != BluetoothDevice.BOND_BONDED) {
+            note("pair: not bonded")
+            lastAuthFailure = "not bonded"
             throw BleException("This phone is not paired with the reader", reason = Reason.BOND)
         }
         val pre = readStatus()
         if (!pre.pairingWindow) {
+            note("pair: pairing_window=false")
+            lastAuthFailure = "pairing window closed"
             throw BleException(friendlyError("pairing window closed"), "pairing window closed", Reason.AUTH)
         }
         val command = JSONObject()
@@ -934,15 +960,23 @@ class BleClient(private val context: Context) {
             .put("host_id", identity.hostId)
             .put("host_name", identity.hostName)
             .put("secret", identity.secret)
-        val awaited = runCatching {
+        val awaitedResult = runCatching {
             commandAwait(command, 8_000) { it.paired || it.authError != null || it.state == "error" }
-        }.getOrNull()
-        val verdict = readStatus()
-        if (verdict.paired || awaited?.paired == true) return@withLock verdict
-        val refusal = verdict.authError ?: awaited?.authError
-            ?: verdict.error?.takeIf { verdict.state == "error" }
+        }
+        val awaited = awaitedResult.getOrNull()
+        note("pair await=" + awaitedResult.fold(
+            { "paired=${it.paired} auth_error=${it.authError ?: "-"}" },
+            { "timeout/err: ${it.message}" },
+        ))
+        val verdict = runCatching { readStatus() }.getOrNull()
+        note("pair verdict paired=${verdict?.paired} auth_error=${verdict?.authError ?: "-"}")
+        if (verdict != null && verdict.paired) return@withLock verdict
+        if (awaited != null && awaited.paired) return@withLock verdict ?: awaited
+        val refusal = verdict?.authError ?: awaited?.authError
+        lastAuthFailure = refusal ?: "not confirmed"
+        note("pair RESULT confirmed=false")
         if (refusal != null) throw BleException(friendlyError(refusal), refusal, Reason.AUTH)
-        verdict
+        throw BleException("The reader did not confirm pairing", reason = Reason.AUTH)
     }
 
     /** Authenticates with a v2 hello, unless this session already is. */
@@ -974,22 +1008,29 @@ class BleClient(private val context: Context) {
         note("host=${identity.hostId.take(8)}… reader=${identity.deviceId?.take(8) ?: "?"}")
         authorized = false
         authedDeviceId = null
+        lastAuthFailure = null
         // Always a fresh GATT read, never the cached status: the reader rotates
         // device_nonce on every accepted hello, and notifications can shed it.
         val pre = runCatching { readStatus() }.getOrElse {
             note("pre-read FAILED: ${it.message}")
+            lastAuthFailure = "status read failed"
             return false
         }
         if ((pre.protocolVersion ?: 0) < PROTOCOL_VERSION) {
             note("protocol_version=${pre.protocolVersion ?: "-"}")
+            lastAuthFailure = "old firmware"
             return false
         }
         val d = pre.deviceNonce
         val i = pre.deviceId
         note("nonce=${if (d.isNullOrBlank()) "ABSENT" else "ok(${d.length})"} device=${i?.take(8) ?: "ABSENT"}")
-        if (d.isNullOrBlank() || i.isNullOrBlank()) return false
+        if (d.isNullOrBlank() || i.isNullOrBlank()) {
+            lastAuthFailure = "no nonce or device id"
+            return false
+        }
         if (identity.deviceId != null && identity.deviceId != i) {
             note("different reader")
+            lastAuthFailure = "different reader"
             return false
         }
         val c = newClientNonce()
@@ -1028,6 +1069,15 @@ class BleClient(private val context: Context) {
         val ok = proofOk && sameReader
         authedDeviceId = if (ok) i else null
         authorized = ok
+        lastAuthFailure = when {
+            ok -> null
+            // The reader's own word wins: "unknown trusted host" means it forgot us.
+            else -> awaited.getOrNull()?.authError ?: verdict?.authError
+                ?: verdict?.error?.takeIf { verdict?.state == "error" && isAuthError(it) }
+                ?: if (!sameReader) "different reader"
+                else if (awaited.isFailure && verdict?.readerProof == null) "no reply"
+                else "bad reader proof"
+        }
         note("RESULT authorized=$ok (proof=$proofOk sameReader=$sameReader)")
         return ok
     }
