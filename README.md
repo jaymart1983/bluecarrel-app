@@ -9,7 +9,7 @@ nothing else.
 
 ## Test builds
 
-- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.1-test)** (download the APK on your phone)
+- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.2-test)** (download the APK on your phone)
 - **[Firmware test release](https://github.com/jaymart1983/bluecarrel-firmware/releases/tag/x4pro-20260914.1959-test)**
 - [All app releases](https://github.com/jaymart1983/bluecarrel-app/releases)
 
