@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- OPDS, kosync and the update page are on the network; the reader is on BLE. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- API 31+ Bluetooth model. neverForLocation is honest here: this app
+         scans for one specific service UUID and does nothing with position,
+         and declaring it keeps the scan out of the location permission. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Pre-31 equivalents. minSdk is 29, and on 29/30 a BLE scan without
+         ACCESS_FINE_LOCATION returns zero results silently. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- Background sync with the reader.
+         POST_NOTIFICATIONS (33+): the sync runs as a foreground service, and a
+         foreground service the user has denied notifications for is a service
+         with an invisible notification, not a silent one.
+         FOREGROUND_SERVICE_CONNECTED_DEVICE (34+): Android 14 requires a typed
+         foreground service, and holding a BLE link to a paired accessory is
+         exactly what connectedDevice is for. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"
+        tools:targetApi="34" />
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS"
+        tools:targetApi="33" />
+
+    <!-- Re-arm the system-held reader scan after a reboot; it does not survive one. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- The one-tap "let this app run in the background" dialog. Without the
+         exemption Android 12+ refuses to start the sync service when the
+         reader wakes while the app is closed. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="true" />
+
+    <!-- Package visibility (API 30+). "Open in KOReader" is greyed out unless
+         some activity can actually view an EPUB, and that question is asked of
+         the package manager rather than answered by looking for a hardcoded
+         package name — there are several KOReader builds and plenty of other
+         capable readers. Without this declaration queryIntentActivities() sees
+         nothing outside our own app and the button would never light up.
+
+         Declared by intent shape, not by package: this grants visibility of
+         apps that handle "view an EPUB" and nothing else. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="application/epub+zip" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".X4SyncApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.X4Sync">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+        <!-- Runs while the reader is connected or being reconnected, so closing
+             the app does not end a sync or the heartbeat kosync writes. Stops
+             itself about 90 s after the link drops with nothing owed. -->
+        <service
+            android:name=".sync.ReaderSyncService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- Delivered by the Bluetooth stack through a PendingIntent scan when
+             the reader advertises, whether or not this app is running. -->
+        <receiver
+            android:name=".sync.ReaderPresenceReceiver"
+            android:exported="false" />
+
+        <!-- Re-registers that scan after a reboot or an app update, both of
+             which drop it. Exported only because BOOT_COMPLETED is a system
+             broadcast; it takes no data and does nothing but re-register. -->
+        <receiver
+            android:name=".sync.ReaderScanRegistrar"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

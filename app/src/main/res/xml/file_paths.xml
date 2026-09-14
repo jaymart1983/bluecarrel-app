@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Cached EPUBs handed to other readers (KOReader) via FileProvider. -->
+    <files-path name="books" path="books/" />
+</paths>

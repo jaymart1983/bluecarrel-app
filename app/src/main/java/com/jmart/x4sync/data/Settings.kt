@@ -1,0 +1,361 @@
+package com.jmart.x4sync.data
+
+import android.content.Context
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import java.util.UUID
+
+private val Context.dataStore by preferencesDataStore("x4sync")
+
+/**
+ * Network settings only. The reader itself is reached over BLE and has no
+ * host or port, and it chooses the upload directory from the transfer `kind`
+ * (book -> /Books, bmp -> /Pictures).
+ *
+ * One server, one account. Calibre-Web Automated serves the OPDS catalogue
+ * and the KOReader sync API from the same origin, and the sync API
+ * authenticates against CWA's own user accounts, so there is nothing left to
+ * configure separately. The two sub-paths are derived, not stored.
+ */
+data class Config(
+    val serverUrl: String = "",
+    val username: String = "",
+    val password: String = "",
+    /**
+     * Where new builds of this app and of the reader firmware are published:
+     * the page that holds `firmware.json`.
+     *
+     * Blank means no update checks -- see [effectiveUpdatesUrl]. Stored
+     * separately from [serverUrl] because the download page is a different
+     * service from Calibre and need not live on the same host.
+     */
+    val updatesUrl: String = "",
+    /** Send a newer reader build in the background as soon as one is seen. */
+    val autoDownloadFirmware: Boolean = false,
+) {
+    /** [updatesUrl], trimmed. Blank when no update page is set. */
+    val effectiveUpdatesUrl: String
+        get() = updatesUrl.trim()
+
+    /** `<base>` with any trailing slashes removed. */
+    val base: String get() = serverUrl.trimEnd('/')
+
+    val opdsUrl: String get() = "$base/opds"
+    val kosyncUrl: String get() = "$base/kosync"
+}
+
+/** Fallback name for this phone on the reader, when the phone reports none. */
+const val APP_HOST_NAME = "X4 Pro Sync"
+
+/** The reader keeps at most this many bytes of a host name (BleLink BLE_HOST_NAME_MAX_BYTES). */
+private const val READER_HOST_NAME_MAX = 48
+
+/**
+ * This phone's own name -- the one set in Android's About phone -- as the reader
+ * will show it under Settings > Bluetooth. Falls back to manufacturer + model, then
+ * to the app name.
+ *
+ * Cleaned to what the reader stores: it replaces anything outside printable ASCII
+ * with '?', so curly quotes (common in names like "Sam’s Pixel") are straightened
+ * first and any other non-ASCII character is dropped rather than shown as a
+ * question mark.
+ */
+fun phoneDisplayName(context: Context): String {
+    val raw = runCatching {
+        android.provider.Settings.Global.getString(context.contentResolver, android.provider.Settings.Global.DEVICE_NAME)
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+        ?: listOf(android.os.Build.MANUFACTURER, android.os.Build.MODEL)
+            .filter { !it.isNullOrBlank() }
+            .joinToString(" ") { it.replaceFirstChar { c -> c.uppercase() } }
+            .takeIf { it.isNotBlank() }
+        ?: APP_HOST_NAME
+    val cleaned = raw
+        .replace('\u2019', '\'').replace('\u2018', '\'')
+        .replace('\u201C', '"').replace('\u201D', '"')
+        .filter { it.code in 32..126 }
+        .trim()
+    val bytes = if (cleaned.length > READER_HOST_NAME_MAX) cleaned.take(READER_HOST_NAME_MAX).trim() else cleaned
+    return bytes.ifBlank { APP_HOST_NAME }
+}
+
+class SettingsStore(private val context: Context) {
+
+    private object K {
+        val serverUrl = stringPreferencesKey("server_url")
+        val username = stringPreferencesKey("server_user")
+        val password = stringPreferencesKey("server_pass")
+        val updatesUrl = stringPreferencesKey("updates_url")
+        val autoDownloadFirmware = booleanPreferencesKey("auto_download_firmware")
+
+        // Superseded by the three keys above. Read once so an existing install
+        // keeps working, then dropped on the next save.
+        // See [baseFromLegacyOpdsUrl].
+        val legacyOpdsUrl = stringPreferencesKey("opds_url")
+        val legacyOpdsUser = stringPreferencesKey("opds_user")
+        val legacyOpdsPass = stringPreferencesKey("opds_pass")
+    }
+
+    val config: Flow<Config> = context.dataStore.data.map { p ->
+        val d = Config()
+        Config(
+            serverUrl = p[K.serverUrl] ?: baseFromLegacyOpdsUrl(p[K.legacyOpdsUrl]) ?: d.serverUrl,
+            username = p[K.username] ?: p[K.legacyOpdsUser] ?: d.username,
+            password = p[K.password] ?: p[K.legacyOpdsPass] ?: d.password,
+            updatesUrl = p[K.updatesUrl] ?: d.updatesUrl,
+            autoDownloadFirmware = p[K.autoDownloadFirmware] ?: d.autoDownloadFirmware,
+        )
+    }
+
+    suspend fun save(c: Config) {
+        context.dataStore.edit { p ->
+            p[K.serverUrl] = c.base
+            p[K.username] = c.username
+            p[K.password] = c.password
+            p[K.updatesUrl] = c.updatesUrl
+            p[K.autoDownloadFirmware] = c.autoDownloadFirmware
+            // The old shape can never be authoritative again; leaving it behind
+            // would only invite a future reader to resurrect it.
+            p.remove(K.legacyOpdsUrl); p.remove(K.legacyOpdsUser); p.remove(K.legacyOpdsPass)
+        }
+    }
+
+    /**
+     * The legacy `opdsUrl` was the full catalogue URL, so the stored value ends
+     * in `/opds`. Strip that to recover the origin [Config.serverUrl] wants.
+     * Credentials migrate from the OPDS pair: those are the CWA account, which
+     * is also what the sync API authenticates against.
+     */
+    private fun baseFromLegacyOpdsUrl(raw: String?): String? {
+        val v = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
+        return v.removeSuffix("/opds").trimEnd('/').takeIf { it.isNotEmpty() }
+    }
+}
+
+/**
+ * The host id + secret this phone presents to the reader.
+ *
+ * Generated once and kept forever: the reader stores the same pair on its
+ * side, so losing this means typing the six-digit code again (and leaving a
+ * stale trusted host on the reader, which it can forget from its own UI).
+ *
+ * The secret is a plain DataStore string. That is honest about its strength:
+ * it is a shared secret for a short-range radio link to an e-reader, not a
+ * credential worth a Keystore-backed envelope. It is no better protected than
+ * the OPDS password already sitting beside it.
+ */
+class PairingStore(private val context: Context) {
+
+    private object K {
+        val hostId = stringPreferencesKey("ble_host_id")
+        val hostName = stringPreferencesKey("ble_host_name")
+        val secret = stringPreferencesKey("ble_host_secret")
+        val deviceId = stringPreferencesKey("ble_device_id")
+        val trusted = booleanPreferencesKey("ble_trusted")
+        // The reader's own name, mirrored here so the connection pill can show
+        // it at launch instead of after the first settings read.
+        val deviceName = stringPreferencesKey("ble_device_name")
+    }
+
+    val deviceName: Flow<String> = context.dataStore.data.map { p -> p[K.deviceName] ?: "" }
+
+    suspend fun setDeviceName(name: String) {
+        context.dataStore.edit { p ->
+            if (name.isBlank()) p.remove(K.deviceName) else p[K.deviceName] = name.take(16)
+        }
+    }
+
+    val identity: Flow<HostIdentity?> = context.dataStore.data.map { p ->
+        val id = p[K.hostId]
+        val secret = p[K.secret]
+        if (id.isNullOrBlank() || secret.isNullOrBlank()) null
+        else HostIdentity(
+            hostId = id,
+            // The phone's current name, not whatever was stored at pairing: the reader
+            // takes it from every hello, so renaming the phone renames it there too.
+            hostName = phoneDisplayName(context),
+            secret = secret,
+            deviceId = p[K.deviceId],
+            trusted = p[K.trusted] ?: false,
+        )
+    }
+
+    suspend fun load(): HostIdentity? = identity.first()
+
+    /** A brand new identity, not yet stored. Persist it only if the reader takes it. */
+    fun mint(hostName: String = phoneDisplayName(context)): HostIdentity = HostIdentity(
+        hostId = UUID.randomUUID().toString(),
+        hostName = hostName,
+        secret = BleClient.newHostSecret(),
+    )
+
+    suspend fun save(identity: HostIdentity) {
+        context.dataStore.edit { p ->
+            p[K.hostId] = identity.hostId
+            p[K.hostName] = identity.hostName
+            p[K.secret] = identity.secret
+            identity.deviceId?.let { p[K.deviceId] = it }
+            p[K.trusted] = identity.trusted
+        }
+    }
+
+    suspend fun clear() {
+        context.dataStore.edit { p ->
+            p.remove(K.hostId); p.remove(K.hostName); p.remove(K.secret)
+            p.remove(K.deviceId); p.remove(K.trusted); p.remove(K.deviceName)
+        }
+    }
+}
+
+/**
+ * Books whose reader copy must be REPLACED on the next send, not skipped.
+ *
+ * A Calibre update downloads a new copy and hands it to the mirror. An ordinary
+ * send to a name the reader already holds comes back "exists", which the app
+ * rightly reads as "already there" -- so without this, an update would arrive as
+ * "already on the reader" while the reader kept the old copy. Persisted because
+ * the send can happen after an app restart, and falling back to the ordinary
+ * send at that point would silently strand the old copy on the card.
+ */
+class ReplaceOnSendStore(private val context: Context) {
+
+    private fun key(deviceId: String?) =
+        stringSetPreferencesKey("replace_on_send_" + (deviceId ?: "unknown"))
+
+    suspend fun load(deviceId: String?): Set<String> =
+        context.dataStore.data.map { it[key(deviceId)] ?: emptySet() }.first()
+
+    suspend fun add(deviceId: String?, filename: String) {
+        context.dataStore.edit { p -> val k = key(deviceId); p[k] = (p[k] ?: emptySet()) + filename }
+    }
+
+    suspend fun forget(deviceId: String?, filename: String) {
+        context.dataStore.edit { p -> val k = key(deviceId); p[k] = (p[k] ?: emptySet()) - filename }
+    }
+
+    /** Whether the one-time full-shelf replace has been queued for this reader. */
+    private fun resentKey(deviceId: String?) = booleanPreferencesKey("resent_all_v2_" + (deviceId ?: "unknown"))
+
+    suspend fun resentAll(deviceId: String?): Boolean =
+        context.dataStore.data.map { it[resentKey(deviceId)] ?: false }.first()
+
+    suspend fun markResentAll(deviceId: String?) {
+        context.dataStore.edit { it[resentKey(deviceId)] = true }
+    }
+}
+
+/**
+ * Books the user chose to restart, despite kosync holding a position.
+ *
+ * Saving a book the user has read before offers to resume at the saved
+ * percentage. If they choose the beginning instead, that choice has to OUTLIVE
+ * the save: the position sync pushes the server's position to the reader on its
+ * own schedule, and the forward-only rule means a 43% server row beats the
+ * reader's page one every time. Without this the reader would be dragged back
+ * to 43% within seconds of the user asking for a fresh start.
+ *
+ * An entry is dropped as soon as the reader reports a position of its own for
+ * that book -- at that point the user has actually read something, the reader
+ * is the newer authority, and normal syncing resumes.
+ */
+class StartFreshStore(private val context: Context) {
+
+    private fun key(deviceId: String?) =
+        stringSetPreferencesKey("start_fresh_" + (deviceId ?: "unknown"))
+
+    suspend fun load(deviceId: String?): Set<String> =
+        context.dataStore.data.map { it[key(deviceId)] ?: emptySet() }.first()
+
+    suspend fun add(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) + filename
+        }
+    }
+
+    suspend fun forget(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) - filename
+        }
+    }
+}
+
+/**
+ * Books the user has removed that the reader has not let go of yet.
+ *
+ * Removing a book while the reader is out of range keeps the local copy until
+ * the reader confirms, and records the filename here, so the row keeps drawing,
+ * greyed, saying what it is waiting for. Deleting the copy straight away would
+ * leave nothing on screen to show that a deletion is still owed, and no way to
+ * tell a removed book from one that was never saved.
+ *
+ * Persisted rather than held in memory because the wait can span an app
+ * restart -- that is the normal case, not the edge one.
+ *
+ * Keyed per device for the same reason [SentBooksStore] is: "removed" is a fact
+ * about one reader, and a second reader has its own idea of what it holds.
+ */
+class PendingRemovalStore(private val context: Context) {
+
+    private fun key(deviceId: String?) =
+        stringSetPreferencesKey("pending_removal_" + (deviceId ?: "unknown"))
+
+    fun names(deviceId: String?): Flow<Set<String>> =
+        context.dataStore.data.map { it[key(deviceId)] ?: emptySet() }
+
+    suspend fun load(deviceId: String?): Set<String> = names(deviceId).first()
+
+    suspend fun add(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) + filename
+        }
+    }
+
+    suspend fun forget(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) - filename
+        }
+    }
+}
+
+/**
+ * Filenames this app has successfully committed to a reader.
+ *
+ * This is app-side bookkeeping, NOT a view of the reader's filesystem: the
+ * BLE protocol exposes no list-files operation, so nothing here is verified
+ * against the device. Entries are keyed by reader device id where the reader
+ * reports one, so pairing with a second reader does not inherit the first
+ * one's history.
+ */
+class SentBooksStore(private val context: Context) {
+
+    private fun key(deviceId: String?) =
+        stringSetPreferencesKey("sent_books_" + (deviceId ?: "unknown"))
+
+    fun names(deviceId: String?): Flow<Set<String>> =
+        context.dataStore.data.map { it[key(deviceId)] ?: emptySet() }
+
+    suspend fun load(deviceId: String?): Set<String> = names(deviceId).first()
+
+    suspend fun add(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) + filename
+        }
+    }
+
+    suspend fun forget(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = (p[k] ?: emptySet()) - filename
+        }
+    }
+}

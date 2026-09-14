@@ -1,0 +1,20 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+dist/
+
+# Local machine and IDE
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# Signing: your own key and its passwords never go in the repo.
+# Copy keystore.properties.example to keystore.properties to use one.
+keystore/
+keystore.properties
+*.jks
+*.keystore

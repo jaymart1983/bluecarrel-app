@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext is required for Calibre-Web and kosync, reached over Tailscale
+  (100.64.0.0/10) which is already an encrypted transport. No traffic here
+  crosses the public internet. The reader itself is no longer on the network
+  at all - it is reached over BLE.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
