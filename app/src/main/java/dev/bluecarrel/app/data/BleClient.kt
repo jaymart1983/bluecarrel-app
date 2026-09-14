@@ -24,13 +24,18 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onSubscription
@@ -52,6 +57,16 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+
+/** A reader seen advertising the transfer service, for the pairing picker. */
+data class DiscoveredReader(
+    /** Bluetooth address, upper case. Pairing connects to exactly this. */
+    val address: String,
+    /** The advertised name, or "Reader" when none was sent. */
+    val name: String,
+    /** Last received signal strength, dBm. */
+    val rssi: Int,
+)
 
 /**
  * BLE GATT client for the Bluecarrel reader's transfer service.
@@ -105,6 +120,9 @@ class BleClient(private val context: Context) {
         private const val OP_TIMEOUT_MS = 10_000L
         private const val CONNECT_TIMEOUT_MS = 20_000L
         private const val SCAN_TIMEOUT_MS = 15_000L
+
+        /** How long the pairing picker scans before it says nothing was found. */
+        const val DISCOVERY_MS = 12_000L
         private const val COMMIT_TIMEOUT_MS = 120_000L
 
         /** The user reads the passkey off the reader and types it. */
@@ -290,6 +308,14 @@ class BleClient(private val context: Context) {
     private var servicesGate: CompletableDeferred<Unit>? = null
     private var mtuGate: CompletableDeferred<Int>? = null
     private var ioGate: CompletableDeferred<ByteArray>? = null
+
+    /**
+     * Devices the picker scan saw, by upper-case address. Pairing connects to the
+     * picked one straight from here: the scan result carries the address type, and
+     * a second scan would spend one of Android's few scan starts per 30 s on a
+     * device that was just seen.
+     */
+    private val discovered = java.util.concurrent.ConcurrentHashMap<String, BluetoothDevice>()
 
     /**
      * A human-readable trace of the last trusted-auth attempt, for the
@@ -535,8 +561,9 @@ class BleClient(private val context: Context) {
     /**
      * Scan, connect, bond, set up.
      *
-     * [address] null scans by service UUID alone (pairing); otherwise only that
-     * address, plus the service UUID, is scanned for and connected to.
+     * Connects to [address] and nothing else -- never "the first reader found".
+     * A device the picker scan saw at that address is used directly; otherwise
+     * that address, plus the service UUID, is scanned for.
      * [allowBond] lets an unbonded reader be bonded here, with Android's system
      * dialog taking the passkey the reader shows. Without it an unbonded reader
      * is refused, so a background reconnect never raises a pairing dialog.
@@ -544,16 +571,17 @@ class BleClient(private val context: Context) {
      * Refuses a reader below protocol_version 2.
      */
     @SuppressLint("MissingPermission")
-    suspend fun connect(address: String? = null, allowBond: Boolean = false): DeviceStatus {
+    suspend fun connect(address: String, allowBond: Boolean = false): DeviceStatus {
         if (_connection.value == BleConnection.CONNECTED &&
-            (address == null || gatt?.device?.address.equals(address, ignoreCase = true))
+            gatt?.device?.address.equals(address, ignoreCase = true)
         ) {
             return readStatus()
         }
         disconnect()
-        _connection.value = BleConnection.SCANNING
+        val seen = discovered.remove(address.uppercase())
+        _connection.value = if (seen != null) BleConnection.CONNECTING else BleConnection.SCANNING
         try {
-            val device = scanForReader(address)
+            val device = seen ?: scanForReader(address)
             _connection.value = BleConnection.CONNECTING
 
             connectGate = CompletableDeferred()
@@ -618,6 +646,62 @@ class BleClient(private val context: Context) {
             )
         }
     }
+
+    /**
+     * Readers advertising the transfer service nearby, for the pairing picker.
+     *
+     * Emits the whole list whenever it changes -- one entry per Bluetooth
+     * address, strongest signal first -- starting with an empty one. Scans at low
+     * latency, filtered to [SERVICE], for [durationMs], then completes; cancelling
+     * the collector stops the scan sooner. Fails with a [BleException]
+     * (NO_ADAPTER, BLUETOOTH_OFF, SCAN_FAILED) the same way [connect] does. The
+     * caller checks the runtime permission first.
+     */
+    @SuppressLint("MissingPermission")
+    fun discoverReaders(durationMs: Long = DISCOVERY_MS): Flow<List<DiscoveredReader>> = callbackFlow {
+        val scanner = adapter().bluetoothLeScanner
+            ?: throw BleException("Bluetooth scanning is unavailable", reason = Reason.SCAN_FAILED)
+        val seen = HashMap<String, DiscoveredReader>()
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val device = result.device ?: return
+                val key = device.address?.uppercase() ?: return
+                val snapshot = synchronized(seen) {
+                    // A scan response can arrive without the name the advertisement carried.
+                    val name = result.scanRecord?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: runCatching { device.name }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: seen[key]?.name
+                        ?: "Reader"
+                    seen[key] = DiscoveredReader(key, name, result.rssi)
+                    discovered[key] = device
+                    seen.values.sortedByDescending { it.rssi }
+                }
+                trySend(snapshot)
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                close(BleException("Bluetooth scan failed (error $errorCode)", reason = Reason.SCAN_FAILED))
+            }
+        }
+        trySend(emptyList())
+        try {
+            scanner.startScan(
+                listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
+                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
+                cb,
+            )
+        } catch (e: Exception) {
+            throw BleException(e.message ?: "Could not start a Bluetooth scan", reason = Reason.SCAN_FAILED)
+        }
+        val timer = launch {
+            delay(durationMs)
+            channel.close()
+        }
+        awaitClose {
+            timer.cancel()
+            runCatching { scanner.stopScan(cb) }
+        }
+    }.conflate()
 
     /** The connected reader's Bluetooth address, or null. */
     @SuppressLint("MissingPermission")
@@ -688,7 +772,7 @@ class BleClient(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun scanForReader(address: String?): BluetoothDevice {
+    private suspend fun scanForReader(address: String): BluetoothDevice {
         val scanner = adapter().bluetoothLeScanner
             ?: throw BleException("Bluetooth scanning is unavailable", reason = Reason.SCAN_FAILED)
         return withTimeoutOrNull(SCAN_TIMEOUT_MS) {
@@ -697,7 +781,7 @@ class BleClient(private val context: Context) {
                 val cb = object : ScanCallback() {
                     override fun onScanResult(callbackType: Int, result: ScanResult) {
                         if (settled) return
-                        if (address != null && !result.device.address.equals(address, ignoreCase = true)) return
+                        if (!result.device.address.equals(address, ignoreCase = true)) return
                         settled = true
                         runCatching { scanner.stopScan(this) }
                         cont.resume(result.device)
@@ -723,7 +807,7 @@ class BleClient(private val context: Context) {
                         listOf(
                             ScanFilter.Builder()
                                 .setServiceUuid(ParcelUuid(SERVICE))
-                                .apply { if (address != null) setDeviceAddress(address) }
+                                .setDeviceAddress(address.uppercase())
                                 .build()
                         ),
                         ScanSettings.Builder()

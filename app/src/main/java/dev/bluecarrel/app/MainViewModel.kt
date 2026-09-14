@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -50,6 +51,16 @@ data class TransferProgress(
 ) {
     val fraction: Float get() = if (total > 0) (sent.toFloat() / total).coerceIn(0f, 1f) else 0f
 }
+
+/**
+ * The pairing picker's scan. [readers] is live while [scanning]; [error] says
+ * why a scan could not run. Separate from the link: looking is not connecting.
+ */
+data class ReaderScan(
+    val scanning: Boolean = false,
+    val readers: List<DiscoveredReader> = emptyList(),
+    val error: String? = null,
+)
 
 /** Where a firmware update started from this app has got to. */
 enum class FirmwarePhase { DOWNLOADING, SENDING, INSTALLING, SCHEDULED }
@@ -176,6 +187,8 @@ data class UiState(
     val device: DeviceStatus? = null,
     /** Filename of the book open on the reader right now, or null. */
     val readerOpenBook: String? = null,
+    /** Filenames in the reader's last library listing. Store rows use it to say "On the reader". */
+    val readerBookNames: Set<String> = emptySet(),
     /** A removal asked for a book that is open on the reader; waiting on the user. */
     val removeOpenPrompt: BookRow? = null,
     /**
@@ -188,6 +201,10 @@ data class UiState(
     val deviceName: String = "",
     val pairing: PairingState = PairingState.UNPAIRED,
     val authorized: Boolean = false,
+    /** The advertised name of the reader being paired, while a pairing runs; null otherwise. */
+    val pairingReaderName: String? = null,
+    /** The pairing picker's scan, while the picker is open; null when it is closed. */
+    val readerScan: ReaderScan? = null,
     val permissionsGranted: Boolean = true,
     val transfer: TransferProgress? = null,
 
@@ -341,6 +358,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var linkFailStreak = 0
     /** A firmware send the link cut off; resumed when the reader reconnects. */
     private var resumeFirmwareVersion: String? = null
+    /**
+     * A pairing with a picked reader is running. Its link reaches CONNECTED
+     * before anything is stored, and everything that watches the link --
+     * reauthentication, the watchdog, presence reconnects, the background
+     * service -- would otherwise treat that as a reconnect of an unpaired app.
+     */
+    private var pairingInProgress = false
+    /** The picker's scan, and a counter so a superseded scan cannot write state. */
+    private var scanJob: Job? = null
+    private var scanGeneration = 0
+    /** The reader already told, this process, that its unknown books were kept. */
+    private var keptAnnouncedFor: String? = null
 
     init {
         store.attach(viewModelScope)
@@ -349,9 +378,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             val identity = pairingStore.load()
+            // Read first, THEN copy. `_state.value.copy(x = suspendingCall())` takes
+            // its snapshot before the call suspends, and writing it back would undo
+            // whatever changed in the meantime.
+            val config = settings.config.first()
+            val storedName = runCatching { pairingStore.deviceName.first() }.getOrDefault("")
             _state.value = _state.value.copy(
-                config = settings.config.first(),
-                deviceName = runCatching { pairingStore.deviceName.first() }.getOrDefault(""),
+                config = config,
+                deviceName = storedName,
                 permissionsGranted = BlePermissions.granted(getApplication()),
                 pairing = if (identity != null) PairingState.TRUSTED else PairingState.UNPAIRED,
                 hasStoredPairing = identity != null,
@@ -406,12 +440,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // authorisation was only ever attempted from connectReader() --
                 // and connectReader() short-circuits when the transport is
                 // already up. So recover here, where the condition is visible.
-                if (c == BleConnection.CONNECTED && !_state.value.authorized) {
+                // Not during a pairing: that link is unauthorised on purpose until
+                // pair and hello finish, and nothing is stored to authenticate with.
+                if (c == BleConnection.CONNECTED && !_state.value.authorized && !pairingInProgress) {
                     reauthenticate()
                 }
                 // Keep the process alive for as long as the link is: closing the
                 // app must not end a sync or the heartbeat kosync writes.
-                if (c == BleConnection.CONNECTED) ReaderSyncService.start(getApplication())
+                // Not during a pairing either: nothing is stored yet, so the service
+                // would find the app unpaired and stop itself. pairReader() starts it.
+                if (c == BleConnection.CONNECTED && !pairingInProgress) ReaderSyncService.start(getApplication())
             }
         }
 
@@ -595,7 +633,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!linkPreflight()) return@launch
 
         val identity = pairingStore.load()
-        if (identity == null) {
+        val address = identity?.address
+        if (identity == null || address.isNullOrBlank()) {
             _state.value = _state.value.copy(
                 pairing = PairingState.UNPAIRED,
                 link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = null, hint = PAIR_HINT),
@@ -610,7 +649,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         // Never bonds here: a background reconnect must not raise a pairing dialog.
-        val outcome = runCatching { ble.connect(identity.address, allowBond = false) }
+        val outcome = runCatching { ble.connect(address, allowBond = false) }
         val status = outcome.getOrElse { e ->
             failLink(e, silent)
             return@launch
@@ -661,6 +700,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * and stop watching for the reader. The Android bond is left for the user.
      */
     private suspend fun onReaderForgotPhone(silent: Boolean) {
+        // Before the pairing is cleared: deviceKey() falls back to it.
+        dropOwedRemovals(deviceKey())
         pairingStore.clear()
         ReaderPresence.unregister(getApplication())
         ble.disconnect()
@@ -670,6 +711,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             storedHostId = null,
             authorized = false,
             pairing = PairingState.UNPAIRED,
+            readerBookNames = emptySet(),
             authTrace = ble.lastAuthTrace,
             lastAuthError = ble.lastAuthError,
             link = link,
@@ -678,78 +720,167 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Pairs with a reader whose Settings screen is open (security v2).
+     * Starts the pairing picker's scan: readers advertising the transfer service,
+     * listed live for [BleClient.DISCOVERY_MS]. Calling it again scans afresh.
      *
-     * Scans by service UUID, connects, bonds (Android's dialog takes the passkey
-     * the reader shows), sends `pair` only on a bonded link while the reader's
-     * pairing window is open, then a hello. The pairing -- identity, the reader's
-     * device_id and Bluetooth address -- is stored only once reader_proof verifies.
+     * Leaves the link and its stage alone on purpose. Looking is not connecting,
+     * and the reader pill must not appear until a reader has been chosen.
      */
-    fun pairReader(): Job {
+    fun startReaderScan() {
+        scanJob?.cancel()
+        val generation = ++scanGeneration
+        if (!BlePermissions.granted(getApplication())) {
+            _state.value = _state.value.copy(
+                permissionsGranted = false,
+                readerScan = ReaderScan(error = BlePermissions.denialMessage),
+            )
+            return
+        }
+        if (!ble.bluetoothEnabled()) {
+            _state.value = _state.value.copy(
+                readerScan = ReaderScan(error = "Bluetooth is off. Turn it on, then scan again."),
+            )
+            return
+        }
+        _state.value = _state.value.copy(readerScan = ReaderScan(scanning = true))
+        scanJob = viewModelScope.launch {
+            var error: String? = null
+            try {
+                ble.discoverReaders().collect { readers ->
+                    val scan = _state.value.readerScan
+                    if (generation == scanGeneration && scan != null) {
+                        _state.value = _state.value.copy(readerScan = scan.copy(readers = readers))
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                error = (e as? BleClient.BleException)?.message ?: "Bluetooth would not scan"
+            } finally {
+                val scan = _state.value.readerScan
+                if (generation == scanGeneration && scan != null) {
+                    _state.value = _state.value.copy(readerScan = scan.copy(scanning = false, error = error))
+                }
+            }
+        }
+    }
+
+    /** Stops the picker's scan and forgets its list. Safe when none is running. */
+    fun stopReaderScan() {
+        scanGeneration++
+        scanJob?.cancel()
+        scanJob = null
+        if (_state.value.readerScan != null) _state.value = _state.value.copy(readerScan = null)
+    }
+
+    /**
+     * Pairs with the reader the user picked, at [address], whose Settings screen
+     * is open (security v2).
+     *
+     * Connects to that address and no other, bonds (Android's dialog takes the
+     * passkey the reader shows), sends `pair` only on a bonded link while the
+     * reader's pairing window is open, then a hello. The pairing -- identity, the
+     * reader's device_id and Bluetooth address -- is stored only once
+     * reader_proof verifies, and the paired state is then published in ONE write.
+     *
+     * [advertisedName] names the pill while this runs, and the reader afterwards
+     * until its own settings name it.
+     */
+    fun pairReader(address: String, advertisedName: String? = null): Job {
         connectJob?.takeIf { it.isActive }?.let { return it }
+        stopReaderScan()
+        val name = advertisedName?.trim()?.take(16)?.ifBlank { null } ?: "Reader"
+        pairingInProgress = true
         return viewModelScope.launch {
-        if (!linkPreflight()) return@launch
-        if (pairingStore.load() != null) {
-            _state.value = _state.value.copy(message = "Forget the current pairing first")
-            return@launch
-        }
-        _state.value = _state.value.copy(
-            permissionsGranted = true,
-            message = null,
-            link = LinkStatus(LinkStage.SCANNING),
-        )
+            try {
+                if (!linkPreflight()) return@launch
+                if (pairingStore.load() != null) {
+                    _state.value = _state.value.copy(message = "Forget the current pairing first")
+                    return@launch
+                }
+                _state.value = _state.value.copy(
+                    permissionsGranted = true,
+                    message = null,
+                    pairingReaderName = name,
+                    link = LinkStatus(LinkStage.CONNECTING),
+                )
 
-        val status = runCatching { ble.connect(address = null, allowBond = true) }.getOrElse { e ->
-            failLink(e, silent = false)
-            return@launch
-        }
-        val address = ble.connectedAddress()
-        val deviceId = status.deviceId
-        if (address == null || deviceId == null) {
-            ble.disconnect()
-            failLink(
-                BleClient.BleException("The reader did not identify itself", reason = BleClient.Reason.NOT_A_READER),
-                silent = false,
-            )
-            return@launch
-        }
-        if (!status.pairingWindow) {
-            ble.disconnect()
-            _state.value = _state.value.copy(
-                link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_CLOSED_HINT),
-                lastAuthError = ble.lastAuthError,
-            )
-            return@launch
-        }
+                val status = runCatching { ble.connect(address, allowBond = true) }.getOrElse { e ->
+                    failLink(e, silent = false)
+                    return@launch
+                }
+                val connectedTo = ble.connectedAddress()
+                val deviceId = status.deviceId
+                if (connectedTo == null || !connectedTo.equals(address, ignoreCase = true) || deviceId == null) {
+                    ble.disconnect()
+                    failLink(
+                        BleClient.BleException("The reader did not identify itself", reason = BleClient.Reason.NOT_A_READER),
+                        silent = false,
+                    )
+                    return@launch
+                }
+                if (!status.pairingWindow) {
+                    ble.disconnect()
+                    _state.value = _state.value.copy(
+                        link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_CLOSED_HINT),
+                        lastAuthError = ble.lastAuthError,
+                    )
+                    return@launch
+                }
 
-        _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
-        val identity = pairingStore.mint().copy(deviceId = deviceId, address = address)
-        // pair() returns only when the reader confirmed paired == true; anything
-        // else throws, and no hello is sent after an unconfirmed pair.
-        runCatching { ble.pair(identity) }.exceptionOrNull()?.let { e ->
-            ble.disconnect()
-            failLink(e, silent = false)
-            return@launch
-        }
-        val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
-        if (!ok) {
-            ble.disconnect()
-            val why = ble.lastAuthFailure?.let { "Pairing failed: $it" } ?: "Pairing failed"
-            _state.value = _state.value.copy(
-                authorized = false,
-                authTrace = ble.lastAuthTrace,
-                lastAuthError = ble.lastAuthError,
-                link = LinkStatus(LinkStage.FAILED, reason = why, hint = PAIR_CLOSED_HINT),
-                message = why,
-            )
-            return@launch
-        }
+                _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
+                val identity = pairingStore.mint().copy(deviceId = deviceId, address = connectedTo)
+                // pair() returns only when the reader confirmed paired == true; anything
+                // else throws, and no hello is sent after an unconfirmed pair.
+                runCatching { ble.pair(identity) }.exceptionOrNull()?.let { e ->
+                    ble.disconnect()
+                    failLink(e, silent = false)
+                    return@launch
+                }
+                val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
+                if (!ok) {
+                    ble.disconnect()
+                    val why = ble.lastAuthFailure?.let { "Pairing failed: $it" } ?: "Pairing failed"
+                    _state.value = _state.value.copy(
+                        authorized = false,
+                        authTrace = ble.lastAuthTrace,
+                        lastAuthError = ble.lastAuthError,
+                        link = LinkStatus(LinkStage.FAILED, reason = why, hint = PAIR_CLOSED_HINT),
+                        message = why,
+                    )
+                    return@launch
+                }
 
-        pairingStore.save(identity)
-        _state.value = _state.value.copy(hasStoredPairing = true, storedHostId = identity.hostId)
-        ReaderPresence.register(getApplication())
-        onAuthorized(silent = true)
-        _state.value = _state.value.copy(message = "Paired")
+                pairingStore.save(identity)
+                runCatching { pairingStore.setDeviceName(name) }
+                linkFailStreak = 0
+                // Everything the UI reads as "paired and connected", in one write. The
+                // link watchers stay held off by pairingInProgress until this job ends,
+                // so nothing can slip a stale or half-paired state in behind it.
+                _state.value = _state.value.copy(
+                    hasStoredPairing = true,
+                    storedHostId = identity.hostId,
+                    pairing = PairingState.TRUSTED,
+                    authorized = true,
+                    connection = ble.connection.value,
+                    link = LinkStatus(LinkStage.CONNECTED),
+                    deviceName = name,
+                    pairingReaderName = null,
+                    authTrace = ble.lastAuthTrace,
+                    lastAuthError = ble.lastAuthError,
+                    message = "Paired",
+                )
+                ReaderPresence.register(getApplication())
+                // The CONNECTED this pairing caused did not start the service (nothing
+                // was stored then), and the link will not change again to start it now.
+                ReaderSyncService.start(getApplication())
+                startConnectedWork()
+            } finally {
+                pairingInProgress = false
+                if (_state.value.pairingReaderName != null) {
+                    _state.value = _state.value.copy(pairingReaderName = null)
+                }
+            }
         }.also { connectJob = it }
     }
 
@@ -790,6 +921,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             message = if (silent) null
             else "Connected to ${_state.value.deviceName.ifBlank { "the reader" }}",
         )
+        startConnectedWork()
+    }
+
+    /** What every newly authorised session does: clock, shelf, catalogue, firmware. */
+    private fun startConnectedWork() {
         viewModelScope.launch {
             // The reader has no clock of its own worth trusting; tell it the
             // time and the zone before anything else uses a timestamp.
@@ -903,6 +1039,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun forgetPairing() = viewModelScope.launch {
         connectJob?.cancel()
+        // Before the pairing is cleared: deviceKey() falls back to it.
+        dropOwedRemovals(deviceKey())
         runCatching {
             getApplication<Application>().startActivity(
                 Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -918,6 +1056,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             authorized = false,
             pairing = PairingState.UNPAIRED,
             link = LinkStatus(LinkStage.IDLE),
+            pairingReaderName = null,
+            readerBookNames = emptySet(),
             message = "Remove the reader here, then pair again",
         )
     }
@@ -1557,8 +1697,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             sendToDevice(row).join()
             sentAny = true
         }
-        // No early return on an empty shelf: an empty shelf is the strongest
-        // statement of what should be on the reader, and the prune carries it out.
+        // No early return on an empty shelf: removals the user made are still owed.
+        // The prune deletes those and nothing else -- see pruneDeviceBooks.
         val removed = pruneDeviceBooks()
         if (removed > 0) {
             _state.value = _state.value.copy(
@@ -2079,72 +2219,99 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val pruneLock = Mutex()
 
     /**
-     * Removes from the reader anything that is no longer on the offline shelf.
+     * Deletes from the reader what the user removed from the offline shelf -- and
+     * nothing else.
      *
-     * The shelf is the contract in both directions: what is saved is on the
-     * reader, and what is not saved is not. Progress is not lost by deleting --
-     * it lives in kosync, so re-saving a book brings the position back with it.
+     * A book on the reader is deleted only when this installation holds a removal
+     * record for it ([PendingRemovalStore]) under the connected reader's own
+     * device_id. That record has one writer, [removeOffline]: the user removing a
+     * book that was on the shelf while the reader was out of reach. (With the
+     * reader in reach, removeOffline deletes it there directly.)
      *
-     * Driven by what the READER reports, not by what this app remembers. That
-     * matters: "not in my library" is only a safe reason to delete if we also
-     * know what is actually there. Diffing the reader's own listing means a
-     * book side-loaded over USB is seen and considered, and -- more importantly
-     * -- a failure to read that listing prunes nothing at all rather than
-     * guessing.
+     * This used to delete everything the reader held that the shelf lacked, and so
+     * wiped a reader's books on the first sync after a fresh install, whose shelf
+     * is empty. A book with no record -- a fresh install, a first pairing, a
+     * pairing after Forget, a USB side-load -- stays on the reader, and is listed
+     * as on the reader ([UiState.readerBookNames]).
+     *
+     * A listing that cannot be read or parsed does nothing at all.
      */
     private suspend fun pruneDeviceBooks(): Int = pruneLock.withLock { pruneDeviceBooksLocked() }
 
     private suspend fun pruneDeviceBooksLocked(): Int {
         val listing = readerLibrary() ?: return 0
-        // A BARE ARRAY of book objects -- BookLibraryIndex writes "[", the
-        // entries, then "]". Not an object with a "books" key: parsing it that
-        // way throws, runCatching turns the throw into an empty list, and an
-        // empty list reads as "nothing to prune".
+        // A BARE ARRAY of book objects -- BookLibraryIndex writes "[", the entries,
+        // then "]". A parse failure is null and stops here: it must never read as
+        // "the reader is empty".
         val onDevice = runCatching {
             val arr = JSONArray(String(listing, Charsets.UTF_8))
             (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("filename")?.ifBlank { null } }
-        }.getOrElse { emptyList() }
-        if (onDevice.isEmpty()) return 0
+        }.getOrNull() ?: return 0
+        // The live reader's id only. deviceKey() falls back to the stored pairing and
+        // then to "unknown"; a record filed under either says nothing about THIS reader.
+        val readerId = _state.value.device?.deviceId ?: return 0
 
-        // A book awaiting removal is still ON DISK -- that is what keeps its row
-        // drawable -- so cachedNames() alone would report it as shelved and the
-        // prune would never touch it. The shelf contract is "saved MINUS owed
-        // removals".
-        val owed = pendingRemovals.load(deviceKey())
-        val shelf = books.cachedNames() - owed
-        val extra = onDevice.filter { it !in shelf }
-        var removed = 0
-        for (filename in extra) {
+        val owed = pendingRemovals.load(readerId)
+        val gone = mutableSetOf<String>()
+        for (filename in onDevice.filter { it in owed }) {
             if (!_state.value.connected || !_state.value.authorized) break
             if (runCatching { ble.deleteBook(filename) }.getOrDefault(false).also { invalidateReaderListing() }) {
-                removed++
-                sentBooks.forget(deviceKey(), filename)
-                // Confirmed gone from the reader, so the local copy that was
-                // being kept purely to draw the pending row can go too. Only
-                // now does the row actually leave the Library.
-                if (filename in owed) {
-                    books.cachedBooks().firstOrNull { it.filename == filename }
-                        ?.let { withContext(Dispatchers.IO) { books.delete(it) } }
-                    pendingRemovals.forget(deviceKey(), filename)
-                }
+                gone += filename
+                // Confirmed gone from the reader, so the local copy kept only to draw
+                // the pending row can go too. Only now does the row leave the Library.
+                settleRemoval(readerId, filename)
             }
         }
-        // A book the reader is no longer holding at all is settled as well:
-        // nothing to delete there, so stop owing it.
+        // Owed, but the reader no longer holds it: nothing to delete there.
         var settled = 0
         for (filename in owed) {
             if (filename !in onDevice) {
-                books.cachedBooks().firstOrNull { it.filename == filename }
-                    ?.let { withContext(Dispatchers.IO) { books.delete(it) } }
-                pendingRemovals.forget(deviceKey(), filename)
-                sentBooks.forget(deviceKey(), filename)
+                settleRemoval(readerId, filename)
                 settled++
             }
         }
-        // Only when something actually moved, not on every sweep of a shelf
-        // that has an outstanding removal.
-        if (removed > 0 || settled > 0) loadLibrary(withProgress = false)
-        return removed
+
+        _state.value = _state.value.copy(readerBookNames = onDevice.toSet() - gone)
+        val shelf = withContext(Dispatchers.IO) { books.cachedNames() }
+        val kept = onDevice.count { it !in shelf && it !in owed }
+        if (kept > 0 && keptAnnouncedFor != readerId) {
+            keptAnnouncedFor = readerId
+            _state.value = _state.value.copy(
+                message = "Kept $kept book${if (kept == 1) "" else "s"} already on the reader",
+            )
+        }
+        if (gone.isNotEmpty() || settled > 0) loadLibrary(withProgress = false)
+        return gone.size
+    }
+
+    /** A removal the reader has carried out, or no longer needs: drop the local copy and both records. */
+    private suspend fun settleRemoval(readerId: String?, filename: String) {
+        withContext(Dispatchers.IO) {
+            books.cachedBooks().firstOrNull { it.filename == filename }?.let { books.delete(it) }
+        }
+        pendingRemovals.forget(readerId, filename)
+        sentBooks.forget(readerId, filename)
+    }
+
+    /**
+     * Ends the removals still owed to [readerId] on this phone only; the reader
+     * keeps its copies.
+     *
+     * Called when a pairing ends (Forget, or the reader forgetting this phone). A
+     * removal was an instruction to the reader as it was paired then. A later
+     * pairing -- even with the same reader -- starts owing nothing, so its first
+     * sync cannot delete anything.
+     */
+    private suspend fun dropOwedRemovals(readerId: String?) {
+        val owed = runCatching { pendingRemovals.load(readerId) }.getOrDefault(emptySet())
+        if (owed.isEmpty()) return
+        for (filename in owed) {
+            withContext(Dispatchers.IO) {
+                books.cachedBooks().firstOrNull { it.filename == filename }?.let { books.delete(it) }
+            }
+            pendingRemovals.forget(readerId, filename)
+        }
+        loadLibrary(withProgress = false)
     }
 
     /**
@@ -3208,7 +3375,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun reauthenticate() {
-        if (reauthInFlight) return
+        if (reauthInFlight || pairingInProgress) return
         reauthInFlight = true
         viewModelScope.launch {
             try {
@@ -3245,6 +3412,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         var backoffMs = RECONNECT_MIN_MS
         while (isActive) {
             delay(LINK_CHECK_MS)
+            if (pairingInProgress) continue
             val identity = pairingStore.load() ?: continue
             if (!BlePermissions.granted(getApplication())) continue
 
@@ -3277,7 +3445,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** The reader was seen advertising, or the service started: connect if nothing is trying. */
     fun onReaderNearby() {
         viewModelScope.launch {
-            if (pairingStore.load() == null) return@launch
+            if (pairingInProgress || pairingStore.load() == null) return@launch
             // The presence scan reports every advertisement, several a second while the
             // reader waits for a phone. At most one attempt every NEARBY_RETRY_MS, and
             // never beside one already running.

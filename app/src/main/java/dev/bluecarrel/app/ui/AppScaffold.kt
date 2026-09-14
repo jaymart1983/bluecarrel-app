@@ -44,14 +44,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.bluecarrel.app.AppTab
 import dev.bluecarrel.app.FirmwarePhase
 import dev.bluecarrel.app.FirmwareProgress
 import dev.bluecarrel.app.MainViewModel
+import dev.bluecarrel.app.ReaderScan
 import dev.bluecarrel.app.TransferProgress
 import dev.bluecarrel.app.UiState
 import dev.bluecarrel.app.data.BlePermissions
+import dev.bluecarrel.app.data.DiscoveredReader
 import dev.bluecarrel.app.data.BookRow
 import dev.bluecarrel.app.data.ResumePrompt
 import dev.bluecarrel.app.data.Config
@@ -119,8 +123,9 @@ fun AppScaffold(vm: MainViewModel) {
                 title = { Text("Bluecarrel") },
                 actions = {
                     // No reader, no pill: an unpaired app pairs from the overflow menu.
-                    // It stays up while a pairing is running so the progress is visible.
-                    if (state.hasStoredPairing || state.link.busy) {
+                    // Not while the picker is only scanning; once a reader has been
+                    // chosen it stays up for the pairing, so the progress is visible.
+                    if (state.hasStoredPairing || state.pairingReaderName != null) {
                         ReaderStatusAction(
                             state = state,
                             onConnect = { vm.connectReader() },
@@ -153,7 +158,7 @@ fun AppScaffold(vm: MainViewModel) {
                             if (!state.hasStoredPairing) {
                                 DropdownMenuItem(
                                     text = { Text("Pair reader") },
-                                    enabled = !state.link.busy,
+                                    enabled = !state.link.busy && state.pairingReaderName == null,
                                     leadingIcon = { Icon(BluetoothVector, null) },
                                     onClick = { overflowOpen = false; showPairing = true },
                                 )
@@ -252,6 +257,8 @@ fun AppScaffold(vm: MainViewModel) {
                             // Only in the Store. In the Library every row is on
                             // the shelf, so tinting them all would say nothing.
                             onShelf = state.tab == AppTab.STORE && row.cached,
+                            onReader = state.tab == AppTab.STORE && !row.cached &&
+                                row.book.filename in state.readerBookNames,
                             busy = row.book.id in state.busyBookIds,
                             removing = row.book.id in state.removingBookIds,
                             awaitingReader = row.book.id in state.pendingTransferIds,
@@ -356,10 +363,21 @@ fun AppScaffold(vm: MainViewModel) {
     }
 
     if (showPairing) {
-        PairDialog(
+        // The scan lives exactly as long as the picker: started when it opens,
+        // stopped however it closes.
+        DisposableEffect(Unit) {
+            vm.startReaderScan()
+            onDispose { vm.stopReaderScan() }
+        }
+        ReaderPickerDialog(
             reason = state.link.reason.takeIf { state.link.stage == LinkStage.NEEDS_PAIRING },
+            scan = state.readerScan,
             onDismiss = { showPairing = false },
-            onPair = { vm.pairReader(); showPairing = false },
+            onRescan = { vm.startReaderScan() },
+            onPick = { reader ->
+                showPairing = false
+                vm.pairReader(reader.address, reader.name)
+            },
         )
     }
 
@@ -491,7 +509,8 @@ private fun ReaderStatusAction(
     // says WHICH reader, which is the thing worth knowing when the phone can
     // remember more than one, and it gives the menu a target big enough to hit
     // without aiming.
-    val pillName = state.deviceName.ifBlank { "X4 Pro" }
+    // While pairing, the name the chosen reader advertised; afterwards, what it calls itself.
+    val pillName = state.pairingReaderName ?: state.deviceName.ifBlank { "Reader" }
     Box {
         Surface(
             onClick = { menuOpen = true },
@@ -850,24 +869,124 @@ private fun TransferBar(t: TransferProgress) {
     }
 }
 
+/**
+ * Pick the reader to pair with. The scan runs while this is open (AppScaffold
+ * starts and stops it); tapping a reader pairs with exactly that one.
+ */
 @Composable
-private fun PairDialog(reason: String?, onDismiss: () -> Unit, onPair: () -> Unit) {
+private fun ReaderPickerDialog(
+    reason: String?,
+    scan: ReaderScan?,
+    onDismiss: () -> Unit,
+    onRescan: () -> Unit,
+    onPick: (DiscoveredReader) -> Unit,
+) {
+    // Null only for the moment before the scan's first state lands: treat as scanning.
+    val scanning = scan?.scanning ?: true
+    val readers = scan?.readers.orEmpty()
+    val error = scan?.error
     AlertDialog(
         onDismissRequest = onDismiss,
-        icon = { Icon(Icons.Default.Lock, null) },
-        title = { Text("Pair with the reader") },
+        icon = { Icon(BluetoothVector, null) },
+        title = { Text("Pair a reader") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 reason?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
-                Text(
-                    "Open Settings on the reader. Tap Pair here, then type the passkey the reader shows into the pairing dialog.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                when {
+                    error != null -> Text(
+                        error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    readers.isEmpty() && scanning -> Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Looking for readers… Open Settings on the reader.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    readers.isEmpty() -> Text("No readers found", style = MaterialTheme.typography.bodyMedium)
+                    else -> {
+                        if (scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                            readers.forEach { r -> ReaderRow(r, onClick = { onPick(r) }) }
+                        }
+                        Text(
+                            "Then type the passkey the reader shows.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onPair) { Text("Pair") } },
+        confirmButton = {
+            TextButton(onClick = onRescan, enabled = !scanning) { Text("Scan again") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+@Composable
+private fun ReaderRow(reader: DiscoveredReader, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 10.dp),
+    ) {
+        Icon(BluetoothVector, null, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                reader.name,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "…" + reader.address.takeLast(5),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        SignalBars(reader.rssi)
+    }
+}
+
+/** Three bars from RSSI: all three from -60 dBm, two from -75, one below that. */
+@Composable
+private fun SignalBars(rssi: Int) {
+    val level = when {
+        rssi >= -60 -> 3
+        rssi >= -75 -> 2
+        else -> 1
+    }
+    val label = when (level) {
+        3 -> "Strong signal"
+        2 -> "Fair signal"
+        else -> "Weak signal"
+    }
+    val on = MaterialTheme.colorScheme.primary
+    val off = MaterialTheme.colorScheme.outlineVariant
+    Row(
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        modifier = Modifier.semantics { contentDescription = label },
+    ) {
+        for (i in 1..3) {
+            Box(
+                Modifier
+                    .width(4.dp)
+                    .height((4 + i * 4).dp)
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(if (i <= level) on else off)
+            )
+        }
+    }
 }
 
 @Composable
@@ -942,6 +1061,8 @@ private fun BookItem(
     awaitingReader: Boolean = false,
     /** This book is open on the reader right now. */
     readingNow: Boolean = false,
+    /** Store only: not saved on this phone, but the reader holds it. */
+    onReader: Boolean = false,
     covers: CoverCache,
     creds: Pair<String, String>,
     onOpenDetail: () -> Unit,
@@ -1001,12 +1122,13 @@ private fun BookItem(
                 // Said in words, not only in grey. A tint is a weak signal for
                 // something the user is explicitly waiting on; a line of text
                 // either appears or it does not.
-                if (removing || owed || pending) {
+                if (removing || owed || pending || onReader) {
                     Text(
                         when {
                             removing -> "Removing from reader…"
                             owed -> "Will be removed on next device sync"
-                            else -> "Waiting to send to reader…"
+                            pending -> "Waiting to send to reader…"
+                            else -> "On the reader"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Medium,
@@ -1234,7 +1356,7 @@ private fun BookDetailSheet(
             }
             if (row.cached && row.sentFromThisApp) {
                 Text(
-                    "Removing it here keeps the reader's copy.",
+                    "Removing it here also removes it from the reader.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
