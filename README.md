@@ -46,8 +46,8 @@ nothing else.
    background use when asked (needed for sync with the app closed).
 2. **Settings:** enter the server URL (for example `https://books.example.com`)
    and your Calibre-Web account. The OPDS catalogue and kosync both use it.
-3. On the reader, open **Settings** from the Action Centre. Enter the pairing
-   code it shows into the app.
+3. On the reader, tap the Power button to open the Control Centre and tap
+   **Settings**. Enter the pairing code it shows into the app.
 4. Optional: set an **update page** URL to receive firmware updates (see below).
 
 If the app stops connecting after an update of the app itself, turn the phone's
