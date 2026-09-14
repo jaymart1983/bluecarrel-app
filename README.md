@@ -35,7 +35,8 @@ nothing else.
 ## Requirements
 
 - Android 10 (API 29) or later with Bluetooth LE.
-- An Xteink X4 Pro running the CrossPoint X4 Pro firmware.
+- An Xteink X4 Pro running the CrossPoint X4 Pro firmware
+  ([`ble-x4pro` branch](https://github.com/jaymart1983/crosspoint-reader/tree/ble-x4pro)).
 - A [Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
   server with OPDS and kosync enabled, reachable from the phone (LAN, VPN or a
   tunnel).
