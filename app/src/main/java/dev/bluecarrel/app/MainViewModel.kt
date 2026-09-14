@@ -852,8 +852,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
             BleClient.Reason.OLD_FIRMWARE -> LinkStatus(
                 LinkStage.FAILED,
-                "Update the reader firmware",
-                "",
+                "This reader needs Bluecarrel firmware",
+                "Install it from github.com/jaymart1983/bluecarrel-firmware",
             )
             else -> LinkStatus(
                 LinkStage.FAILED,
@@ -878,7 +878,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             authorized = false,
             authTrace = ble.lastAuthTrace,
             lastAuthError = ble.lastAuthError,
-            message = if (silent) null else status.reason,
+            // With no reader pill (unpaired), this message is the only place the
+            // failure shows, so it carries the what-to-do line too.
+            message = if (silent) null
+            else listOfNotNull(status.reason, status.hint?.takeIf { it.isNotBlank() }).joinToString(". "),
         )
     }
 

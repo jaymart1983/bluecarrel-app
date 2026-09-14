@@ -118,14 +118,18 @@ fun AppScaffold(vm: MainViewModel) {
             TopAppBar(
                 title = { Text("Bluecarrel") },
                 actions = {
-                    ReaderStatusAction(
-                        state = state,
-                        onConnect = { vm.connectReader() },
-                        onPair = { showPairing = true },
-                        onDisconnect = { vm.disconnectReader() },
-                        onDeviceSettings = { showDeviceSettings = true },
-                        onFirmware = { settingsSection = SettingsSection.FIRMWARE },
-                    )
+                    // No reader, no pill: an unpaired app pairs from the overflow menu.
+                    // It stays up while a pairing is running so the progress is visible.
+                    if (state.hasStoredPairing || state.link.busy) {
+                        ReaderStatusAction(
+                            state = state,
+                            onConnect = { vm.connectReader() },
+                            onPair = { showPairing = true },
+                            onDisconnect = { vm.disconnectReader() },
+                            onDeviceSettings = { showDeviceSettings = true },
+                            onFirmware = { settingsSection = SettingsSection.FIRMWARE },
+                        )
+                    }
                     // One refresh, not two: the catalogue AND the reader, so the
                     // obvious "bring things up to date" control does the whole job.
                     IconButton(
@@ -146,6 +150,15 @@ fun AppScaffold(vm: MainViewModel) {
                             expanded = overflowOpen,
                             onDismissRequest = { overflowOpen = false },
                         ) {
+                            if (!state.hasStoredPairing) {
+                                DropdownMenuItem(
+                                    text = { Text("Pair reader") },
+                                    enabled = !state.link.busy,
+                                    leadingIcon = { Icon(BluetoothVector, null) },
+                                    onClick = { overflowOpen = false; showPairing = true },
+                                )
+                                HorizontalDivider()
+                            }
                             // Firmware belongs to the READER, so it lives in the pill
                             // with the reader's other controls, not with the app's.
                             for (sec in SettingsSection.entries.filter { it != SettingsSection.FIRMWARE }) {
@@ -847,7 +860,7 @@ private fun PairDialog(reason: String?, onDismiss: () -> Unit, onPair: () -> Uni
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 reason?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
                 Text(
-                    "On the reader, open Settings. Tap Pair, then enter the passkey it shows.",
+                    "Open Settings on the reader. Tap Pair here, then type the passkey the reader shows into the pairing dialog.",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }

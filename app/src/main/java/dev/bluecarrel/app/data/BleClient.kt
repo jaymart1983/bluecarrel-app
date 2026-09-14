@@ -605,7 +605,7 @@ class BleClient(private val context: Context) {
 
             val initial = readStatus()
             if ((initial.protocolVersion ?: 0) < PROTOCOL_VERSION) {
-                throw BleException("Update the reader firmware", reason = Reason.OLD_FIRMWARE)
+                throw BleException("This reader needs Bluecarrel firmware", reason = Reason.OLD_FIRMWARE)
             }
             _connection.value = BleConnection.CONNECTED
             return initial
