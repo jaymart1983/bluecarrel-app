@@ -11,6 +11,8 @@ import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -98,6 +100,18 @@ fun AppScaffold(vm: MainViewModel) {
     /** The book whose detail sheet is open, if any. Held by filename because
      *  the row object is replaced whenever the shelf or the catalogue reloads. */
     var detailOf by remember { mutableStateOf<String?>(null) }
+
+    // Pull to refresh: the spinner stays while anything the pull started is running,
+    // and a moment longer, so a refresh with nothing to do is still seen to happen.
+    var pulled by remember { mutableStateOf(false) }
+    val refreshWork = state.loading || state.syncingLibrary || state.syncingProgress ||
+        state.firmwareChecking || state.link.busy
+    LaunchedEffect(pulled, refreshWork) {
+        if (pulled && !refreshWork) {
+            delay(800)
+            pulled = false
+        }
+    }
     val snackbar = remember { SnackbarHostState() }
 
     LaunchedEffect(state.message) {
@@ -139,7 +153,7 @@ fun AppScaffold(vm: MainViewModel) {
                     // One refresh, not two: the catalogue AND the reader, so the
                     // obvious "bring things up to date" control does the whole job.
                     IconButton(
-                        onClick = { vm.refreshEverything() },
+                        onClick = { vm.pullToRefresh() },
                         enabled = !state.loading && !state.syncingLibrary && !state.syncingProgress,
                     ) {
                         Icon(Icons.Default.Refresh, "Refresh")
@@ -247,11 +261,19 @@ fun AppScaffold(vm: MainViewModel) {
                     }
                 }
 
+            PullToRefreshBox(
+                isRefreshing = pulled,
+                onRefresh = { pulled = true; vm.pullToRefresh() },
+                modifier = Modifier.fillMaxSize(),
+            ) {
             if (shown.isEmpty() && !state.loading && !state.searching) {
-                if (state.tab == AppTab.LIBRARY) {
-                    EmptyLibraryHint(onBrowse = { vm.setTab(AppTab.STORE) })
-                } else {
-                    EmptyHint()
+                // Scrollable, or a pull on an empty list has nothing to drag.
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    if (state.tab == AppTab.LIBRARY) {
+                        EmptyLibraryHint(onBrowse = { vm.setTab(AppTab.STORE) })
+                    } else {
+                        EmptyHint()
+                    }
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
@@ -276,6 +298,7 @@ fun AppScaffold(vm: MainViewModel) {
                         HorizontalDivider()
                     }
                 }
+            }
             }
             }
         }

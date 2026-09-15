@@ -709,6 +709,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Pull to refresh, and the refresh button: Calibre, the firmware page and the
+     * reader in one gesture. A paired reader that is not connected is connected
+     * first; connecting runs its own sync and firmware check.
+     */
+    fun pullToRefresh(): Job {
+        val s = _state.value
+        if (s.hasStoredPairing && !s.connected && !s.link.busy) connectReader()
+        checkFirmware()
+        return refreshEverything()
+    }
+
+    /**
      * The reading position already known for a book, by filename.
      *
      * Free and always available: the Library rows carry it, and a book in the
