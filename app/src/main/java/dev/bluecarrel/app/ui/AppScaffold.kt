@@ -1597,20 +1597,24 @@ private fun SettingsSheet(
                         },
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                    // Enabled as soon as the page has a newer build. A check or a sync in
+                    // progress does not block it: the send waits for the sync, and
+                    // installLatestFirmware() re-checks the reader's build before sending.
+                    val newer = latest != null && (running == null || running < latest.version)
                     Button(
                         onClick = onInstallFirmware,
-                        enabled = linked && latest != null && !upToDate && state.transfer == null &&
-                            !state.readerUpdateStaged && progress == null && !state.firmwareChecking,
+                        enabled = linked && newer && !upToDate && !state.readerUpdateStaged && progress == null,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text(
                             when {
                                 progress != null -> firmwareProgressLabel(progress)
-                                state.firmwareChecking -> "Checking for updates\u2026"
                                 upToDate -> "Reader is up to date"
                                 state.readerInstallAtSleep -> "Installs when the reader sleeps"
                                 state.readerUpdateStaged -> "Waiting on the reader"
-                                else -> "Install latest on reader"
+                                latest != null -> "Send ${latest.version} to the reader"
+                                state.firmwareChecking -> "Checking for updates\u2026"
+                                else -> "No update found"
                             }
                         )
                     }
