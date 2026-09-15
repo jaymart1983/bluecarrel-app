@@ -139,7 +139,7 @@ fun DeviceSettingsScreen(
                         // frontlight or a touchscreen has no field for some of
                         // these, and its document simply omits them.
                         val rows = DeviceSettingsSchema.of(group)
-                            .filter { ui.values.containsKey(it.key) }
+                            .filter { ui.values.containsKey(it.key) || ui.textValues.containsKey(it.key) }
                         if (rows.isEmpty()) continue
 
                         val open = expanded[group] == true
@@ -227,8 +227,9 @@ private fun SaveBar(ui: DeviceSettingsUi, onSave: () -> Unit, onDiscard: () -> U
                     Text(
                         when {
                             ui.saving -> "Saving…"
-                            ui.dirty -> "Save ${ui.edits.size} change" +
-                                if (ui.edits.size == 1) "" else "s"
+                            ui.dirty -> (ui.edits.size + ui.textEdits.size).let { n ->
+                                "Save $n change" + if (n == 1) "" else "s"
+                            }
                             else -> "Nothing to save"
                         }
                     )
@@ -344,7 +345,13 @@ private fun TextRow(
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
         OutlinedTextField(
             value = value,
-            onValueChange = { onEdit(setting.key, it.take(setting.maxLength)) },
+            onValueChange = {
+                onEdit(
+                    setting.key,
+                    if (setting.asciiOnly) DeviceSettingsSchema.asciiName(it, setting.maxLength)
+                    else it.take(setting.maxLength),
+                )
+            },
             label = { Text(setting.label) },
             placeholder = { Text(setting.placeholder) },
             singleLine = true,

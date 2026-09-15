@@ -787,10 +787,14 @@ class BleClient(private val context: Context) {
                 val device = result.device ?: return
                 val key = device.address?.uppercase() ?: return
                 val snapshot = synchronized(seen) {
-                    // A scan response can arrive without the name the advertisement carried.
+                    // The reader sends its name in the scan response, so a result
+                    // for the advertisement alone has none: keep the name already
+                    // seen for this address. BluetoothDevice.name comes last,
+                    // because Android caches it from the GAP name and keeps a
+                    // renamed reader's old name.
                     val name = result.scanRecord?.deviceName?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: seen[key]?.name?.takeIf { it != "Reader" }
                         ?: runCatching { device.name }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
-                        ?: seen[key]?.name
                         ?: "Reader"
                     seen[key] = DiscoveredReader(key, name, result.rssi)
                     discovered[key] = device

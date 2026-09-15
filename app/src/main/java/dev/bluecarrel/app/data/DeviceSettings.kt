@@ -90,6 +90,9 @@ sealed class DeviceSetting {
      * integer one: every other setting the reader has is an enum index, a
      * bool or a number, and widening the whole pipeline to `Any` to carry one
      * string would make every read site do a type check it does not need.
+     *
+     * [asciiOnly] keeps the field to printable ASCII, one byte a character, so
+     * [maxLength] is also the byte limit the firmware enforces.
      */
     data class Text(
         override val key: String,
@@ -97,6 +100,7 @@ sealed class DeviceSetting {
         override val group: DeviceSettingGroup,
         val maxLength: Int,
         val placeholder: String = "",
+        val asciiOnly: Boolean = false,
         override val help: String? = null,
     ) : DeviceSetting()
 
@@ -112,6 +116,13 @@ sealed class DeviceSetting {
 }
 
 object DeviceSettingsSchema {
+
+    /** What the reader advertises while its device name is blank. */
+    const val DEFAULT_DEVICE_NAME = "Bluecarrel"
+    const val DEVICE_NAME_MAX_BYTES = 16
+
+    /** [input] cut to printable ASCII (0x20-0x7E) and at most [max] characters. */
+    fun asciiName(input: String, max: Int): String = input.filter { it.code in 0x20..0x7E }.take(max)
 
     /**
      * Every row, in the order it is shown.
@@ -134,14 +145,17 @@ object DeviceSettingsSchema {
      */
     val all: List<DeviceSetting> = listOf(
 
-        // First, and deliberately: it is the one setting that is about WHICH
-        // reader this is rather than how it behaves, and it is the label the
-        // app shows in the connection pill.
+        // The first row of the first group, which opens by default: it is the one
+        // setting about WHICH reader this is rather than how it behaves. The reader
+        // advertises it, so it names the reader in the pairing list and the pill.
+        // Same rule as the firmware's normalizeDeviceName(): trimmed, then at most
+        // 16 bytes of printable ASCII; blank means the default.
         DeviceSetting.Text(
-            "deviceName", "Device name", DeviceSettingGroup.SYSTEM,
-            maxLength = 16,
-            placeholder = "X4 Pro",
-            help = "Shown in this app. Up to 16 characters.",
+            "deviceName", "Device name", DeviceSettingGroup.DISPLAY,
+            maxLength = DEVICE_NAME_MAX_BYTES,
+            placeholder = DEFAULT_DEVICE_NAME,
+            asciiOnly = true,
+            help = "Letters, digits, spaces, punctuation.",
         ),
 
         // ----------------------------------------------------------- display
@@ -351,7 +365,7 @@ object DeviceSettingsSchema {
     ): JSONObject {
         val out = JSONObject(doc.toString())
         for ((k, v) in edits) out.put(k, v)
-        for ((k, v) in textEdits) out.put(k, v)
+        for ((k, v) in textEdits) out.put(k, v.trim())
         return out
     }
 

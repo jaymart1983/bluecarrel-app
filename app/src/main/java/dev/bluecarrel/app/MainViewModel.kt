@@ -2536,6 +2536,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         read.getOrNull()?.let { doc ->
             aboutDoc = doc
             rememberAboutFeatures(doc)
+            // The name the reader advertises. Absent on older firmware.
+            if (doc.has("device_name")) rememberDeviceName(doc.optString("device_name"))
         }
         read
     }
@@ -4211,9 +4213,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private var deviceSettingsDoc: org.json.JSONObject? = null
 
-    /** Publishes the reader's name to the pill, and remembers it across launches. */
+    /**
+     * Publishes the reader's name to the pill, and remembers it across launches.
+     * Null (a document without the field, from older firmware) changes nothing;
+     * blank is the name the reader advertises by default.
+     */
     private fun rememberDeviceName(name: String?) {
-        val clean = name?.trim().orEmpty().take(16)
+        if (name == null) return
+        val clean = name.trim().take(DeviceSettingsSchema.DEVICE_NAME_MAX_BYTES)
+            .ifBlank { DeviceSettingsSchema.DEFAULT_DEVICE_NAME }
         if (clean == _state.value.deviceName) return
         _state.value = _state.value.copy(deviceName = clean)
         viewModelScope.launch { runCatching { pairingStore.setDeviceName(clean) } }
