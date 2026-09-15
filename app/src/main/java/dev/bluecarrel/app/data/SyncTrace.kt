@@ -1,5 +1,6 @@
 package dev.bluecarrel.app.data
 
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -71,5 +72,50 @@ class SyncTrace(val startedAt: Long = System.currentTimeMillis()) {
 
         fun size(bytes: Long): String =
             if (bytes < 1024L) "$bytes B" else String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+    }
+}
+
+/**
+ * How the last sync ended, for the line the sync bar keeps afterwards: a sync
+ * is over too quickly to catch while it runs. The clock is left to the screen,
+ * which knows the user's 12/24-hour setting.
+ */
+data class SyncSummary(
+    val finishedAt: Long,
+    val durationMs: Long,
+    val result: Result,
+    /** "1 book sent, 2 positions moved", "up to date", "reader disconnected". */
+    val detail: String,
+    /** Something reached the reader, or failed to. "Up to date" did neither. */
+    val changed: Boolean,
+) {
+    enum class Result { DONE, INCOMPLETE, STOPPED }
+
+    fun line(clock: String): String = when (result) {
+        Result.DONE ->
+            "Synced $clock · ${String.format(Locale.getDefault(), "%.1f s", durationMs / 1000.0)} · $detail"
+        Result.INCOMPLETE -> "Sync incomplete $clock · $detail"
+        Result.STOPPED -> "Sync stopped $clock · $detail"
+    }
+
+    fun toJson(): String = JSONObject()
+        .put("finished_at", finishedAt)
+        .put("duration_ms", durationMs)
+        .put("result", result.name)
+        .put("detail", detail)
+        .put("changed", changed)
+        .toString()
+
+    companion object {
+        fun fromJson(json: String): SyncSummary? = runCatching {
+            val j = JSONObject(json)
+            SyncSummary(
+                finishedAt = j.getLong("finished_at"),
+                durationMs = j.optLong("duration_ms"),
+                result = Result.valueOf(j.getString("result")),
+                detail = j.getString("detail"),
+                changed = j.optBoolean("changed"),
+            )
+        }.getOrNull()
     }
 }

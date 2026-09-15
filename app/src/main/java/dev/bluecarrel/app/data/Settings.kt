@@ -38,6 +38,8 @@ data class Config(
     val updatesUrl: String = "",
     /** Send a newer reader build in the background as soon as one is seen. */
     val autoDownloadFirmware: Boolean = false,
+    /** Turn the reader's dark mode on and off when the phone's changes. */
+    val matchPhoneDarkMode: Boolean = true,
 ) {
     /**
      * The update page in use: [updatesUrl] trimmed, [DEFAULT_UPDATES_URL] when
@@ -120,6 +122,7 @@ class SettingsStore(private val context: Context) {
         val password = stringPreferencesKey("server_pass")
         val updatesUrl = stringPreferencesKey("updates_url")
         val autoDownloadFirmware = booleanPreferencesKey("auto_download_firmware")
+        val matchPhoneDarkMode = booleanPreferencesKey("match_phone_dark_mode")
 
         // Superseded by the three keys above. Read once so an existing install
         // keeps working, then dropped on the next save.
@@ -137,6 +140,7 @@ class SettingsStore(private val context: Context) {
             password = p[K.password] ?: p[K.legacyOpdsPass] ?: d.password,
             updatesUrl = p[K.updatesUrl] ?: d.updatesUrl,
             autoDownloadFirmware = p[K.autoDownloadFirmware] ?: d.autoDownloadFirmware,
+            matchPhoneDarkMode = p[K.matchPhoneDarkMode] ?: d.matchPhoneDarkMode,
         )
     }
 
@@ -147,6 +151,7 @@ class SettingsStore(private val context: Context) {
             p[K.password] = c.password
             p[K.updatesUrl] = c.updatesUrl
             p[K.autoDownloadFirmware] = c.autoDownloadFirmware
+            p[K.matchPhoneDarkMode] = c.matchPhoneDarkMode
             // The old shape can never be authoritative again; leaving it behind
             // would only invite a future reader to resurrect it.
             p.remove(K.legacyOpdsUrl); p.remove(K.legacyOpdsUser); p.remove(K.legacyOpdsPass)
@@ -509,5 +514,37 @@ class SentBooksStore(private val context: Context) {
             val k = key(deviceId)
             p[k] = (p[k] ?: emptySet()) - filename
         }
+    }
+}
+
+/** The last sync's summary, so the sync bar can still say how it went after a restart. */
+class LastSyncStore(private val context: Context) {
+
+    private val key = stringPreferencesKey("last_sync")
+
+    suspend fun load(): SyncSummary? =
+        context.dataStore.data.map { it[key] }.first()?.let(SyncSummary::fromJson)
+
+    suspend fun save(summary: SyncSummary) {
+        context.dataStore.edit { it[key] = summary.toJson() }
+    }
+}
+
+/**
+ * The phone's dark mode as last sent to each reader, by device_id.
+ *
+ * Edge-triggered on purpose: the reader is told only when the phone's mode
+ * differs from what it was last told, so a switch made on the reader itself
+ * stays until the phone next changes.
+ */
+class DarkModeSentStore(private val context: Context) {
+
+    private fun key(deviceId: String?) = booleanPreferencesKey("dark_mode_sent_" + (deviceId ?: "unknown"))
+
+    /** Null when nothing was ever sent to this reader. */
+    suspend fun load(deviceId: String?): Boolean? = context.dataStore.data.map { it[key(deviceId)] }.first()
+
+    suspend fun put(deviceId: String?, dark: Boolean) {
+        context.dataStore.edit { it[key(deviceId)] = dark }
     }
 }

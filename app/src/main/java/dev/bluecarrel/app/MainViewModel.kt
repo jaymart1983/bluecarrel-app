@@ -1,7 +1,9 @@
 package dev.bluecarrel.app
 
 import android.app.Application
+import android.content.ComponentCallbacks
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
@@ -53,6 +55,61 @@ data class TransferProgress(
     val kbps: Int = 0,
 ) {
     val fraction: Float get() = if (total > 0) (sent.toFloat() / total).coerceIn(0f, 1f) else 0f
+}
+
+/**
+ * The rate a transfer bar shows: bytes over about the last two seconds, not the
+ * whole-transfer average, so a slow patch shows. Nothing for the first half
+ * second, and the number changes at most twice a second so it can be read.
+ */
+class RateMeter {
+    private val samples = ArrayDeque<Pair<Long, Long>>()
+    private var firstAt = 0L
+    private var shownAt = 0L
+    private var shown = 0
+
+    /** Records [bytes] moved so far; returns the KB/s to show, 0 for none. */
+    fun kbps(bytes: Long): Int {
+        val now = System.currentTimeMillis()
+        if (firstAt == 0L) firstAt = now
+        if (samples.isEmpty() || now - samples.last().first >= SAMPLE_MS) samples.addLast(now to bytes)
+        // One sample from before the window stays as its baseline.
+        while (samples.size > 2 && now - samples[1].first >= WINDOW_MS) samples.removeFirst()
+        if (now - firstAt < HIDDEN_MS) return 0
+        if (now - shownAt < HOLD_MS) return shown
+        val (since, base) = samples.first()
+        if (now <= since) return shown
+        shown = ((bytes - base) * 1000 / (now - since) / 1024).toInt()
+        shownAt = now
+        return shown
+    }
+
+    private companion object {
+        const val WINDOW_MS = 2_000L
+        const val SAMPLE_MS = 100L
+        const val HIDDEN_MS = 500L
+        const val HOLD_MS = 500L
+    }
+}
+
+/** The phone is in dark mode. */
+private fun isNight(config: Configuration): Boolean =
+    (config.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+
+/** What one run of the sync did to the reader, for [UiState.lastSync]. */
+private class SyncTally {
+    val startedAt = System.currentTimeMillis()
+    /** A pass found the reader linked; without that nothing here was a sync of it. */
+    var linked = false
+    var booksSent = 0
+    var booksFailed = 0
+    var removed = 0
+    var removeFailed = 0
+    var positions = 0
+    /** Short reasons something was left undone, e.g. "book open on reader". */
+    val problems = linkedSetOf<String>()
+    /** The run itself threw. */
+    var error: String? = null
 }
 
 /**
@@ -174,6 +231,8 @@ data class UiState(
     val syncingLibrary: Boolean = false,
     /** What the mirror is doing right now, for the status bar. Null when idle. */
     val syncStatus: String? = null,
+    /** How the last sync ended; shown in the status bar once it is idle. */
+    val lastSync: SyncSummary? = null,
     /**
      * Pending "resume or restart?" question for a book just saved offline.
      *
@@ -274,6 +333,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /** Coalesce upload progress to roughly 100 UI updates per book. */
         const val PROGRESS_STEP_BYTES = 32 * 1024L
 
+        /** A sync that found nothing to do this soon after one that did leaves that one on the bar. */
+        const val SYNC_SUMMARY_HOLD_MS = 60_000L
+
         /** How often the link is verified against the reader rather than assumed. */
         const val LINK_CHECK_MS = 10_000L
         const val RECONNECT_MIN_MS = 3_000L
@@ -326,6 +388,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val startFresh = StartFreshStore(app)
     private val owedResumes = OwedResumeStore(app)
     private val replaceOnSend = ReplaceOnSendStore(app)
+    private val lastSyncStore = LastSyncStore(app)
+    private val darkModeSent = DarkModeSentStore(app)
 
     /** Completed by [answerResume]; awaited by the save that raised the prompt. */
     private var resumeAnswer: CompletableDeferred<Boolean>? = null
@@ -398,7 +462,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Network work a sync started and does not wait for; its trace closes after this. */
     private val traceWork = mutableListOf<Job>()
 
+    // --- phone dark mode --------------------------------------------------------
+    // Also ahead of init, which registers the watcher.
+
+    /** The phone's dark mode as last seen. */
+    private var phoneDark = isNight(app.resources.configuration)
+    /** One set_dark_mode decision at a time: a connect and a phone change can race. */
+    private val darkModeLock = Mutex()
+
+    /** Registered on the Application, so it hears changes with no Activity open. */
+    private val configWatcher = object : ComponentCallbacks {
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            val dark = isNight(newConfig)
+            if (dark == phoneDark) return
+            phoneDark = dark
+            // At once and on its own, not as a sync pass.
+            viewModelScope.launch { matchPhoneDarkMode() }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onLowMemory() = Unit
+    }
+
     init {
+        app.registerComponentCallbacks(configWatcher)
         // PHY and priority reports arrive on Bluetooth threads.
         ble.onLinkEvent = { text ->
             viewModelScope.launch {
@@ -428,6 +515,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 hasStoredPairing = identity != null,
                 storedHostId = identity?.hostId,
             )
+            // Unless a sync has already finished since launch.
+            runCatching { lastSyncStore.load() }.getOrNull()?.let { saved ->
+                if (_state.value.lastSync == null) _state.value = _state.value.copy(lastSync = saved)
+            }
             // Before the catalogue, and separately from it: the shelf is on
             // disk, so it must render on a launch with no network at all --
             // which is precisely the launch where an offline library is the
@@ -986,6 +1077,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // A new session may be a different reader or new firmware.
         aboutFeatures = null
         aboutDoc = null
+        ble.setDownloadCapabilities(null, windowed = false)
         invalidateReaderListing()
         _state.value = _state.value.copy(
             authorized = true,
@@ -1008,6 +1100,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The shelf is the contract: whatever is saved offline belongs on the
             // reader, so a fresh connection is the moment to make that true.
             requestSync(positions = true)
+            // The phone may have switched while the app was closed.
+            trackWork(viewModelScope.launch { matchPhoneDarkMode() })
             refreshCatalogueIfStale()
             checkFirmwareOnConnect()
             resumeInterruptedFirmware()
@@ -1250,6 +1344,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         try {
             val entries = readerLibrary(forPositions = true)
             if (entries == null) {
+                tally?.problems?.add("library not read")
                 _state.value = _state.value.copy(message = "Could not read the reader's library")
                 return
             }
@@ -1326,6 +1421,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (upload.isFailure) {
                     pulled.forEach { (f, p) -> if (f !in serverPositionsForReader) serverPositionsForReader[f] = p }
                 }
+                noteSyncPositions(toDevice.size, upload.exceptionOrNull())
                 var owedNotice: String? = null
                 if (owedSent.isNotEmpty()) {
                     val shelf = withContext(Dispatchers.IO) { books.cachedBooks() }.associateBy { it.filename }
@@ -1344,6 +1440,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (runKosync) startKosyncPass(forKosync, readerKey)
         } finally {
             _state.value = _state.value.copy(syncingProgress = false)
+        }
+    }
+
+    /** A position batch of [count] entries, for the sync bar's summary. */
+    private fun noteSyncPositions(count: Int, failure: Throwable?) {
+        val run = tally ?: return
+        when {
+            failure == null -> run.positions += count
+            (failure as? BleClient.BleException)?.code == "book open" -> run.problems += "book open on reader"
+            else -> run.problems += "positions not sent"
         }
     }
 
@@ -1369,6 +1475,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 ble.uploadBytes(batch, kind = "progress")
             }
         }
+        noteSyncPositions(1, upload.exceptionOrNull())
         val shelf = withContext(Dispatchers.IO) { books.cachedBooks() }.associateBy { it.filename }
         val sent = mapOf(filename to stamp)
         val notice = settleOwedResumes(readerKey, sent, owed, upload.exceptionOrNull(), shelf)
@@ -2015,6 +2122,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // No early return on an empty shelf: removals the user made are still owed.
         // The prune deletes those and nothing else -- see pruneDeviceBooks.
         val removed = pruneDeviceBooks()
+        tally?.let { it.removed += removed }
         if (removed > 0) {
             _state.value = _state.value.copy(
                 message = "Removed $removed book${if (removed == 1) "" else "s"} from the reader",
@@ -2051,6 +2159,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         syncJob?.takeIf { it.isActive }?.let { return it }
         val trace = beginTrace()
         val job = viewModelScope.launch {
+            val run = SyncTally()
+            tally = run
             _state.value = _state.value.copy(syncingLibrary = true, syncStatus = "Syncing with reader\u2026")
             // The shortest connection interval for the whole sync, not per request.
             ble.holdFastLink()
@@ -2065,14 +2175,61 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     syncWantPositions = false
                     runSyncPass(cat, set, pos)
                 }
+            } catch (e: Throwable) {
+                run.error = if (e is CancellationException) "cancelled"
+                else (e.message ?: e.javaClass.simpleName).take(40)
+                throw e
             } finally {
                 ble.releaseFastLink()
-                _state.value = _state.value.copy(syncingLibrary = false, syncStatus = null)
+                tally = null
+                val summary = syncSummary(run)
+                _state.value = _state.value.copy(syncingLibrary = false, syncStatus = null, lastSync = summary)
+                if (summary != null && run.linked) viewModelScope.launch { runCatching { lastSyncStore.save(summary) } }
                 closeTraceWhenIdle(trace)
             }
         }
         syncJob = job
         return job
+    }
+
+    /** The sync running now; see [SyncTally]. */
+    private var tally: SyncTally? = null
+
+    /**
+     * The line the sync bar keeps once [run] is over. The one already shown when
+     * [run] never reached the reader, or found nothing to do moments after a sync
+     * that did something: that result is the one worth reading.
+     */
+    private fun syncSummary(run: SyncTally): SyncSummary? {
+        val previous = _state.value.lastSync
+        if (!run.linked) return previous
+        val now = System.currentTimeMillis()
+        fun count(n: Int, what: String) = if (n == 1) "1 $what" else "$n ${what}s"
+        val parts = mutableListOf<String>()
+        if (run.booksSent > 0) parts += count(run.booksSent, "book") + " sent"
+        if (run.removed > 0) parts += "${run.removed} removed"
+        if (run.positions > 0) parts += count(run.positions, "position") + " moved"
+        if (run.booksFailed > 0) parts += "${run.booksFailed} not sent"
+        if (run.removeFailed > 0) parts += "${run.removeFailed} not removed"
+        parts += run.problems
+        val result = when {
+            !_state.value.connected || !_state.value.authorized -> SyncSummary.Result.STOPPED
+            run.error != null -> SyncSummary.Result.STOPPED
+            run.booksFailed > 0 || run.removeFailed > 0 || run.problems.isNotEmpty() -> SyncSummary.Result.INCOMPLETE
+            else -> SyncSummary.Result.DONE
+        }
+        val detail = when {
+            !_state.value.connected || !_state.value.authorized -> "reader disconnected"
+            run.error != null -> run.error!!
+            parts.isEmpty() -> "up to date"
+            else -> parts.joinToString(", ")
+        }
+        val summary = SyncSummary(now, now - run.startedAt, result, detail, changed = parts.isNotEmpty())
+        if (result == SyncSummary.Result.DONE && !summary.changed && previous != null &&
+            previous.result == SyncSummary.Result.DONE && previous.changed &&
+            now - previous.finishedAt < SYNC_SUMMARY_HOLD_MS
+        ) return previous
+        return summary
     }
 
     /**
@@ -2087,6 +2244,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // A refresh that finds Calibre changes asks for another pass itself.
         if (catalogue) trackWork(refresh())
         val linked = _state.value.connected && _state.value.authorized
+        if (linked) tally?.linked = true
         if (linked) resendShelfOnce()
 
         val changes = calibreQueue.toList()
@@ -2213,7 +2371,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** filename -> outcome of the last `progress` batch, or null when the reader cannot say. */
     private suspend fun progressResults(): Map<String, String>? = runCatching {
-        val bytes = traced<ByteArray>("progress_result", bytes = { it.size.toLong() }) {
+        val bytes = traced<ByteArray>(
+            "progress_result",
+            bytes = { it.size.toLong() },
+            note = { ble.lastDownloadShape },
+        ) {
             ble.download("progress_result")
         }
         val arr = JSONArray(String(bytes, Charsets.UTF_8))
@@ -2248,7 +2410,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val cached = aboutDoc
         if (!fresh && cached != null) return@withLock Result.success(cached)
         val read = runCatching {
-            val bytes = traced<ByteArray>("about", bytes = { it.size.toLong() }) { ble.download("about") }
+            val bytes = traced<ByteArray>("about", bytes = { it.size.toLong() }, note = { ble.lastDownloadShape }) {
+                ble.download("about")
+            }
             JSONObject(String(bytes, Charsets.UTF_8))
         }
         read.getOrNull()?.let { doc ->
@@ -2260,9 +2424,48 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun rememberAboutFeatures(about: JSONObject) {
         val arr = about.optJSONArray("features")
-        aboutFeatures = if (arr == null) emptySet()
+        val features = if (arr == null) emptySet()
         else (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }.toSet()
+        aboutFeatures = features
+        // Downloads after this one may use bigger frames and fewer acks. Both absent
+        // on older firmware, which keeps 160 bytes and an ack per frame.
+        ble.setDownloadCapabilities(
+            about.optInt("download_chunk_max", 0).takeIf { it > 0 },
+            windowed = "download_window" in features,
+        )
     }
+
+    /**
+     * Tells the reader the phone's dark mode when it differs from what this reader
+     * was last told. Edge-triggered, so a switch made on the reader stays until the
+     * phone next changes. Recorded only once the reader has accepted it.
+     */
+    private suspend fun matchPhoneDarkMode(): Unit = darkModeLock.withLock {
+        if (!_state.value.config.matchPhoneDarkMode) return@withLock
+        if (!_state.value.connected || !_state.value.authorized) return@withLock
+        val dark = isNight(getApplication<Application>().resources.configuration)
+        phoneDark = dark
+        val readerId = deviceKey()
+        if (runCatching { darkModeSent.load(readerId) }.getOrNull() == dark) return@withLock
+        // This connection's `about`, which a connect reads anyway.
+        if (aboutFeatures == null) readAbout(fresh = false)
+        if (aboutFeatures?.contains(DARK_MODE) != true) return@withLock
+        val sent = runCatching {
+            traced<Unit>("dark mode " + if (dark) "on" else "off") { ble.setDarkMode(dark) }
+        }.isSuccess
+        if (!sent) return@withLock
+        runCatching { darkModeSent.put(readerId, dark) }
+        // An open Reader settings screen would otherwise show the old value.
+        deviceSettingsDoc?.let { doc ->
+            val v = if (dark) 1 else 0
+            doc.put(SCREEN_INVERTED, if (doc.opt(SCREEN_INVERTED) is Boolean) dark else v)
+            val ui = _state.value.deviceSettings
+            if (ui.loaded) setDeviceSettings(ui.copy(values = ui.values + (SCREEN_INVERTED to v)))
+        }
+    }
+
+    private val DARK_MODE = "dark_mode"
+    private val SCREEN_INVERTED = "screenInverted"
 
     /**
      * The reader's library fingerprint as of the last status seen.
@@ -2745,7 +2948,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (!forPositions || positionsCurrent) return kept.map { JSONObject(it.toString()) }
         }
         val bytes = runCatching {
-            traced<ByteArray>("library", bytes = { it.size.toLong() }) { ble.download("library") }
+            traced<ByteArray>("library", bytes = { it.size.toLong() }, note = { ble.lastDownloadShape }) {
+                ble.download("library")
+            }
         }.getOrNull() ?: return null
         // A BARE ARRAY of book objects -- BookLibraryIndex writes "[", the entries,
         // then "]". A parse failure is null and stops the caller.
@@ -2824,7 +3029,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun pruneDeviceBooksLocked(): Int {
         // A listing that cannot be read or parsed is null and stops here: it must
         // never read as "the reader is empty".
-        val listing = readerLibrary(forPositions = false) ?: return 0
+        val listing = readerLibrary(forPositions = false) ?: run {
+            tally?.problems?.add("library not read")
+            return 0
+        }
         val onDevice = listing.mapNotNull { it.optString("filename").ifBlank { null } }
         // The live reader's id only. deviceKey() falls back to the stored pairing and
         // then to "unknown"; a record filed under either says nothing about THIS reader.
@@ -2839,6 +3047,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }.getOrDefault(false)
             // No answer may still have deleted it: only a confirmed removal is kept locally.
             if (deleted) listingRemove(filename) else invalidateReaderListing()
+            if (!deleted) tally?.let { it.removeFailed++ }
             if (deleted) {
                 gone += filename
                 // Confirmed gone from the reader, so the local copy kept only to draw
@@ -3317,11 +3526,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     ?.takeIf { it.appliedAt == 0L && it.hasJump }
                     ?.takeIf { readerTakesBookPosition() }
             }
+            var meter = RateMeter()
             val onProgress: (Long, Long) -> Unit = { sent, total ->
+                // Every call, so the meter has samples between the bar's updates.
+                val kbps = meter.kbps(sent)
                 if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
                     lastShown = sent
                     _state.value = _state.value.copy(
-                        transfer = TransferProgress("Transferring: ${row.book.title}", sent, total)
+                        transfer = TransferProgress("Transferring: ${row.book.title}", sent, total, kbps)
                     )
                 }
             }
@@ -3347,6 +3559,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (positionStamp == 0L || e.code != "invalid position") throw e
                 positionStamp = 0L
                 lastShown = 0L
+                meter = RateMeter()
                 traced<BleClient.UploadResult>(traceName, bytes = { it.bytes }) {
                     ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
                 }
@@ -3365,6 +3578,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (positionStamp > 0L && r.positionApplied) {
                     owedResumes.markApplied(deviceId, row.book.filename, positionStamp)
                 }
+                tally?.let { it.booksSent++ }
                 // On the reader now: the row goes back to full colour.
                 markPendingTransfer(row.book.id, false)
                 val secs = (r.elapsedMs / 1000.0).coerceAtLeast(0.1)
@@ -3380,6 +3594,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     // Stays owed, and retried from the status stream (at most every
                     // 30s) until the book is closed. Said ONCE: every retry while the
                     // book is still open would otherwise repeat the same line.
+                    tally?.problems?.add("book open on reader")
                     val first = bookOpenDeferredAt == 0L
                     bookOpenDeferredAt = System.currentTimeMillis()
                     if (first) "Close \"${row.book.title}\" on the reader so its update can be sent" else null
@@ -3387,6 +3602,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     // Asked to replace and still refused: firmware older than the
                     // replace flag. Keep it owed and SAY so -- marking it sent here
                     // is exactly the silent-stale-copy bug this path exists to fix.
+                    tally?.problems?.add("reader firmware too old")
                     "Update the reader's firmware to replace \"${row.book.title}\""
                 } else if (code == "exists") {
                     sentBooks.add(deviceId, row.book.filename)
@@ -3395,6 +3611,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     markPendingTransfer(row.book.id, false)
                     "\"${row.book.title}\" is already on the reader"
                 } else {
+                    tally?.let { it.booksFailed++ }
                     "Send failed: ${e.message}"
                 }
             },
@@ -3457,14 +3674,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         _state.value = _state.value.copy(transfer = TransferProgress(displayName, 0, staged.length()))
         var lastShown = 0L
-        var firstByteAt = 0L
+        val meter = RateMeter()
         val outcome = runCatching {
             ble.upload(staged, name = "firmware.bin", kind = "firmware", version = version, signature = signature) { sent, total ->
-                if (firstByteAt == 0L) firstByteAt = System.currentTimeMillis()
+                val kbps = meter.kbps(sent)
                 if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
                     lastShown = sent
-                    val elapsed = System.currentTimeMillis() - firstByteAt
-                    val kbps = if (elapsed > 0) (sent * 1000 / elapsed / 1024).toInt() else 0
                     _state.value = _state.value.copy(
                         transfer = TransferProgress(displayName, sent, total, kbps),
                         firmwareProgress = _state.value.firmwareProgress?.let { p ->
@@ -3605,6 +3820,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ) {
             installLatestFirmware()
         }
+    }
+
+    /** The Reader settings switch for dark mode. Saved quietly, and applied now when on. */
+    fun setMatchPhoneDarkMode(on: Boolean) = viewModelScope.launch {
+        val c = _state.value.config.copy(matchPhoneDarkMode = on)
+        settings.save(c)
+        _state.value = _state.value.copy(config = c)
+        if (on) matchPhoneDarkMode()
     }
 
     /** The Reader settings switch. Saved quietly: no catalogue reload, no "Settings saved". */
@@ -3921,7 +4144,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         setDeviceSettings(ui.copy(loading = true, loadError = null, notice = null))
         runCatching {
-            val bytes = traced<ByteArray>("settings", bytes = { it.size.toLong() }) { ble.download("settings") }
+            val bytes = traced<ByteArray>("settings", bytes = { it.size.toLong() }, note = { ble.lastDownloadShape }) {
+                ble.download("settings")
+            }
             org.json.JSONObject(String(bytes, Charsets.UTF_8).trim())
         }.fold(
             onSuccess = { doc ->
@@ -4186,6 +4411,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     override fun onCleared() {
         super.onCleared()
+        getApplication<Application>().unregisterComponentCallbacks(configWatcher)
         // Not launched on viewModelScope: that scope is already cancelled here.
         ble.disconnect()
     }

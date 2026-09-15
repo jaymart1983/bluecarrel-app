@@ -44,6 +44,8 @@ fun DeviceSettingsScreen(
     onDismissNotice: () -> Unit,
     autoDownloadFirmware: Boolean,
     onAutoDownloadFirmware: (Boolean) -> Unit,
+    matchPhoneDarkMode: Boolean,
+    onMatchPhoneDarkMode: (Boolean) -> Unit,
     readerFirmware: String?,
 ) {
     var confirmDiscard by remember { mutableStateOf(false) }
@@ -87,7 +89,7 @@ fun DeviceSettingsScreen(
         Column(Modifier.padding(pad).fillMaxSize()) {
             ui.notice?.let { NoticeBanner(it.text, it.isError, onDismissNotice) }
 
-            // The one row here that belongs to the APP rather than the reader: fetching
+            // The rows here that belong to the APP rather than the reader: fetching
             // and sending is the phone's job, so it saves the instant it is switched and
             // never waits on the reader's Save. Its partner, auto-install, is the
             // reader's own setting and sits under System with the rest.
@@ -114,6 +116,17 @@ fun DeviceSettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
             )
+            // Also the app's: it saves at once, and the reader is told when the phone switches.
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onMatchPhoneDarkMode(!matchPhoneDarkMode) }
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Match phone dark mode", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                Switch(checked = matchPhoneDarkMode, onCheckedChange = onMatchPhoneDarkMode)
+            }
             HorizontalDivider()
 
             when {

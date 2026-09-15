@@ -58,6 +58,7 @@ import dev.bluecarrel.app.data.BlePermissions
 import dev.bluecarrel.app.data.DiscoveredReader
 import dev.bluecarrel.app.data.BookRow
 import dev.bluecarrel.app.data.ResumePrompt
+import dev.bluecarrel.app.data.SyncSummary
 import dev.bluecarrel.app.data.Config
 import dev.bluecarrel.app.data.CoverCache
 import dev.bluecarrel.app.data.LinkStage
@@ -193,6 +194,10 @@ fun AppScaffold(vm: MainViewModel) {
                 StoreBar(state.storeActivity!!)
             } else if (state.syncingLibrary) {
                 StoreBar(state.syncStatus ?: "Syncing books with the reader…")
+            } else if (state.lastSync != null && state.hasStoredPairing) {
+                // Where "Syncing" just was, and it stays: a sync is over too fast
+                // to read while it runs.
+                SyncSummaryBar(state.lastSync!!)
             }
             if (state.loading && !state.syncingLibrary) LinearProgressIndicator(Modifier.fillMaxWidth())
 
@@ -308,6 +313,8 @@ fun AppScaffold(vm: MainViewModel) {
                 onDismissNotice = { vm.dismissDeviceSettingsNotice() },
                 autoDownloadFirmware = state.config.autoDownloadFirmware,
                 onAutoDownloadFirmware = { vm.setAutoDownloadFirmware(it) },
+                matchPhoneDarkMode = state.config.matchPhoneDarkMode,
+                onMatchPhoneDarkMode = { vm.setMatchPhoneDarkMode(it) },
                 readerFirmware = state.readerFirmware,
             )
         }
@@ -831,6 +838,49 @@ private fun StoreBar(activity: String) {
     }
 }
 
+/** How the last sync ended, in the sync bar's place. No spinner: nothing is running. */
+@Composable
+private fun SyncSummaryBar(s: SyncSummary) {
+    val context = LocalContext.current
+    // A minute tick, so a sync from before midnight picks up its date.
+    val now by produceState(System.currentTimeMillis()) {
+        while (true) {
+            kotlinx.coroutines.delay(60_000L)
+            value = System.currentTimeMillis()
+        }
+    }
+    val time = android.text.format.DateFormat.getTimeFormat(context).format(Date(s.finishedAt))
+    val sameDay = Calendar.getInstance().run {
+        timeInMillis = s.finishedAt
+        val day = get(Calendar.YEAR) * 1000 + get(Calendar.DAY_OF_YEAR)
+        timeInMillis = now
+        day == get(Calendar.YEAR) * 1000 + get(Calendar.DAY_OF_YEAR)
+    }
+    val clock = if (sameDay) time
+    else SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(s.finishedAt)) + " " + time
+    val failed = s.result != SyncSummary.Result.DONE
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (failed) Icons.Default.Warning else Icons.Default.CheckCircle,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                s.line(clock),
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
 /** BLE moves a few KB/s, so a real byte-level bar is the difference between
  *  "working" and "hung". Zero total means an indeterminate phase. */
 @Composable
@@ -849,7 +899,7 @@ private fun TransferBar(t: TransferProgress) {
                 )
                 Spacer(Modifier.width(12.dp))
                 // Percent first: the question being asked is "how far along". A
-                // firmware send adds its rate, which says whether minutes remain.
+                // send adds its rate, which says whether minutes remain.
                 Text(
                     when {
                         t.total <= 0 -> "…"

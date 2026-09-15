@@ -187,7 +187,7 @@ object DeviceSettingsSchema {
             "frontlightRestoreOnWake", "Restore frontlight on wake", DeviceSettingGroup.DISPLAY,
         ),
         DeviceSetting.Toggle(
-            "screenInverted", "Night mode", DeviceSettingGroup.DISPLAY,
+            "screenInverted", "Dark mode", DeviceSettingGroup.DISPLAY,
             help = "Inverts the whole interface, not just the page.",
         ),
 

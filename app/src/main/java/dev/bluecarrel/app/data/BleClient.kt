@@ -119,8 +119,17 @@ class BleClient(private val context: Context) {
         /** Credit window before we must wait for the reader to catch up. */
         const val ACK_BYTES = 24_000
 
-        /** The reference client's download chunk size. */
+        /**
+         * The reference client's download chunk size, and the most older firmware
+         * accepts: it refuses a larger chunk_size outright.
+         */
         const val DOWNLOAD_CHUNK_BYTES = 160
+
+        /** Frames per get_ack for a reader that advertises `download_window`. */
+        const val DOWNLOAD_WINDOW = 8
+
+        /** How long a set_dark_mode waits for the reader to refuse it. */
+        private const val DARK_MODE_ERROR_MS = 1_000L
 
         private const val DEFAULT_MTU = 23
         private const val OP_TIMEOUT_MS = 10_000L
@@ -299,6 +308,19 @@ class BleClient(private val context: Context) {
 
     @Volatile private var mtu: Int = DEFAULT_MTU
     @Volatile private var authorized: Boolean = false
+
+    /**
+     * What this connection's reader says it can take on a download, from its
+     * `about` document; see [setDownloadCapabilities]. Until then (and on old
+     * firmware) every download is 160-byte frames, each one acked.
+     */
+    @Volatile private var downloadChunkMax: Int? = null
+    @Volatile private var downloadWindowed: Boolean = false
+
+    /** Chunk size and window the last download ran with, for the sync trace. */
+    @Volatile
+    var lastDownloadShape: String = ""
+        private set
 
     /** The device_id the verified hello was made with. A status naming another reader drops authorisation. */
     @Volatile private var authedDeviceId: String? = null
@@ -587,6 +609,8 @@ class BleClient(private val context: Context) {
         authorized = false
         authedDeviceId = null
         mtu = DEFAULT_MTU
+        downloadChunkMax = null
+        downloadWindowed = false
         priorityHigh = false
         phy = null
         _connection.value = BleConnection.IDLE
@@ -1118,6 +1142,23 @@ class BleClient(private val context: Context) {
         )
     }
 
+    /**
+     * Turns the reader's dark mode on or off. Only for a reader whose `about`
+     * lists `dark_mode`; older firmware must never see the op.
+     *
+     * Success changes no state, so it is the absence of an `error` status for
+     * [DARK_MODE_ERROR_MS] after the write. An unrelated error in that window
+     * reads as a refusal, which only means it is sent again next time.
+     */
+    suspend fun setDarkMode(dark: Boolean) {
+        if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
+        val command = JSONObject().put("op", "set_dark_mode").put("dark", dark)
+        val refused = withTimeoutOrNull(DARK_MODE_ERROR_MS) {
+            statusUpdates.onSubscription { writeControl(command) }.first { it.state == "error" }
+        }
+        if (refused != null) failIfError(refused)
+    }
+
     // ---------------------------------------------------------------- auth
 
     /**
@@ -1621,6 +1662,17 @@ class BleClient(private val context: Context) {
     // ------------------------------------------------------------ download
 
     /**
+     * What this reader's `about` document says downloads may use:
+     * `download_chunk_max` (null when absent) and `download_window` in its
+     * `features`. Cleared when the link goes down, so the next connection's
+     * `about` is read at the old settings.
+     */
+    fun setDownloadCapabilities(chunkMax: Int?, windowed: Boolean) {
+        downloadChunkMax = chunkMax?.takeIf { it > 0 }
+        downloadWindowed = windowed
+    }
+
+    /**
      * Pulls a download kind (the firmware advertises `crash_report`) frame by
      * frame, acknowledging each one. Frames must arrive in sequence; a gap
      * means we lost a notification and the transfer is not trustworthy.
@@ -1634,10 +1686,19 @@ class BleClient(private val context: Context) {
         var received = 0L
         var expected = 0L
 
+        // Above 160 only for a reader that advertised a maximum: older firmware
+        // refuses the whole start_get. A frame must still fit one notification.
+        val fit = downloadChunkMax?.let { minOf(it, mtu - 3 - FRAME_HEADER_BYTES) } ?: 0
+        val chunk = if (fit > DOWNLOAD_CHUNK_BYTES) fit else DOWNLOAD_CHUNK_BYTES
+        val window = if (downloadWindowed) DOWNLOAD_WINDOW else 1
+        lastDownloadShape = "chunk $chunk, window $window"
+
         val start = JSONObject()
             .put("op", "start_get")
             .put("kind", kind)
-            .put("chunk_size", DOWNLOAD_CHUNK_BYTES)
+            .put("chunk_size", chunk)
+        // Omitted, not 1, so a reader without windows sees the request it always has.
+        if (window > 1) start.put("window", window)
 
         holdFastLink()
         try {
@@ -1703,11 +1764,23 @@ class BleClient(private val context: Context) {
                             "Out-of-order frame: got ${frame.sequence}, expected $expected"
                         )
                     }
+                    // Any length up to the chunk asked for: the reader need not say
+                    // which size it settled on.
+                    if (frame.payload.size > chunk) {
+                        throw BleException("Oversized frame: ${frame.payload.size} bytes, asked for $chunk")
+                    }
                     chunks += frame.payload
                     received += frame.payload.size
                     expected += 1
                     onProgress(received)
-                    writeControl(JSONObject().put("op", "get_ack").put("sequence", frame.sequence))
+                    // get_ack is cumulative: one covers every frame up to it. Every
+                    // window-th frame and always the last; with no size to tell the
+                    // last one by, every frame.
+                    val known = size
+                    val last = known != null && received >= known
+                    if (window == 1 || known == null || last || (frame.sequence + 1) % window == 0L) {
+                        writeControl(JSONObject().put("op", "get_ack").put("sequence", frame.sequence))
+                    }
                 }
             } catch (e: Throwable) {
                 runCatching { writeControl(JSONObject().put("op", "cancel")) }
