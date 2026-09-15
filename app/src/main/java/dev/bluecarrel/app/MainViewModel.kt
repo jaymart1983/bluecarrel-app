@@ -1364,25 +1364,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * "itvl 15 ms, dl 251/251, phy 2M, msys min 2, queue 40, sd 3.1 s, loop 4.0 s, gap 180 ms,
-     * 62/s avg 70/s max, …" from `about`. `last_upload` counts only when it is this upload
-     * (same kind and bytes). Null when the firmware reports neither.
+     * "itvl 7.5-15 ms (req 7.5 ms accepted), dl 251/251, phy 2M, msys min 2, acl min 6, queue 40,
+     * sd 3.1 s, loop 4.0 s, gap 180 ms, 62/s avg 70/s max, …" from `about`. The interval is
+     * the range seen during the upload (`last_upload`), or the one in force now on firmware
+     * that does not report it. `last_upload` counts only when it is this upload (same kind
+     * and bytes). Null when the firmware reports neither.
      */
     private fun readerUploadNote(about: JSONObject, t: BleClient.UploadTiming): String? {
         val parts = mutableListOf<String>()
-        about.optJSONObject("link")?.let { l ->
-            if (l.has("interval_ms")) {
-                val itvl = l.optDouble("interval_ms")
-                parts += "itvl " + (if (itvl % 1.0 == 0.0) itvl.toLong().toString() else itvl.toString()) + " ms"
-            }
+        val l = about.optJSONObject("link")
+        val u = about.optJSONObject("last_upload")
+            ?.takeIf { it.optString("kind") == t.kind && it.optLong("bytes", -1L) == t.bytes }
+        fun msText(v: Double) = if (v % 1.0 == 0.0) v.toLong().toString() else v.toString()
+        fun rangeText(o: JSONObject, min: String, max: String): String {
+            val lo = o.optDouble(min)
+            val hi = o.optDouble(max)
+            return if (lo == hi) msText(lo) else "${msText(lo)}-${msText(hi)}"
+        }
+        val itvl = when {
+            u != null && u.has("itvl_min_ms") && u.has("itvl_max_ms") -> rangeText(u, "itvl_min_ms", "itvl_max_ms")
+            l != null && l.has("interval_ms") -> msText(l.optDouble("interval_ms"))
+            else -> null
+        }
+        val requested = (u?.optJSONObject("requested") ?: l?.optJSONObject("requested"))?.let { r ->
+            "req ${rangeText(r, "min_ms", "max_ms")} ms ${r.optString("result")}"
+        }
+        if (itvl != null) parts += "itvl $itvl ms" + (requested?.let { " ($it)" } ?: "")
+        if (l != null) {
             if (l.has("tx_octets") && l.has("rx_octets")) {
                 parts += "dl ${l.optInt("tx_octets")}/${l.optInt("rx_octets")}" +
                     if (l.optBoolean("dl_reported", true)) "" else " (default)"
             }
             l.optString("phy").ifBlank { null }?.let { parts += "phy $it" }
         }
-        val u = about.optJSONObject("last_upload")
-            ?.takeIf { it.optString("kind") == t.kind && it.optLong("bytes", -1L) == t.bytes }
         if (u != null) {
             fun ms(key: String) = SyncTrace.duration(u.optLong(key))
             if (u.has("min_msys_free")) parts += "msys min ${u.optInt("min_msys_free")}"

@@ -765,7 +765,9 @@ class BleClient(private val context: Context) {
             enableNotifications(dataOut!!)
 
             requestPreferredPhy(g)
-            // A sync that was holding the link fast before a reconnect still is.
+            // A sync that was holding the link fast before a reconnect still is. Sent
+            // before any start_put on this link, so the reader's 7.5 ms request still
+            // comes after it (see [holdFastLink]).
             if (fastHolds.get() > 0) setPriority(high = true)
 
             val initial = readStatus()
@@ -1067,6 +1069,19 @@ class BleClient(private val context: Context) {
      * that interval. Held for a whole sync, not per request, so the interval is
      * not renegotiated between steps; balanced again [FAST_LINK_LINGER_MS] after
      * the last hold ends.
+     *
+     * Ordering with the reader's own request. HIGH asks Android for 11.25-15 ms
+     * (config gatt_high_priority_min/max_interval 9/12) and phones usually settle
+     * on 15 ms. The reader asks for 7.5 ms itself when a start_put or a book or
+     * library start_get begins, which is always after this call: a sync holds from
+     * its start, and upload()/download() take their hold before writing
+     * start_put/start_get. Android keeps whichever request came last
+     * (L2CA_UpdateBleConnParams and l2cble_process_rc_param_request_evt both
+     * overwrite the link's stored parameters), so the reader's 7.5 ms wins. The app
+     * therefore requests priority only when the hold count goes 0 -> 1 and on
+     * reconnect ([setPriority] ignores a request for the priority already in force),
+     * never mid-transfer, and balanced only after the last hold ends. When the two
+     * requests collide at the link layer, the reader repeats its own.
      */
     fun holdFastLink() {
         if (fastHolds.incrementAndGet() == 1) {
