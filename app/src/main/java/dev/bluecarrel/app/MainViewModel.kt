@@ -51,10 +51,39 @@ data class TransferProgress(
     val label: String,
     val sent: Long,
     val total: Long,
-    /** Bluetooth rate, shown beside the percentage when above 0. */
+    /** Transfer rate, shown beside the percentage when above 0. */
     val kbps: Int = 0,
+    /**
+     * Who started it, e.g. "firmware" or "book:<filename>". Only the owner ends
+     * it, so one job finishing does not clear the bar out from under another.
+     */
+    val owner: String,
 ) {
     val fraction: Float get() = if (total > 0) (sent.toFloat() / total).coerceIn(0f, 1f) else 0f
+    val percent: Int get() = if (total > 0) (sent * 100 / total).toInt().coerceIn(0, 100) else 0
+}
+
+/** "31 KB/s", or "1.2 MB/s" from 1000 KB/s. */
+fun transferRate(kbps: Int): String =
+    if (kbps >= 1000) String.format(java.util.Locale.getDefault(), "%.1f MB/s", kbps / 1024.0)
+    else "$kbps KB/s"
+
+/**
+ * Lets progress reach the screen about four times a second, plus the end.
+ * A fast download reports hundreds of times a second; every one of those was
+ * a recomposition of the whole scaffold.
+ */
+class ProgressGate(private val everyMs: Long = 250L) {
+    private var lastAt = 0L
+    private var opened = false
+
+    fun due(sent: Long, total: Long): Boolean {
+        val now = System.nanoTime() / 1_000_000
+        if (opened && now - lastAt < everyMs && !(total > 0 && sent >= total)) return false
+        opened = true
+        lastAt = now
+        return true
+    }
 }
 
 /**
@@ -316,6 +345,8 @@ data class UiState(
     val previousSyncTrace: List<String> = emptyList(),
     /** MTU, PHY and connection priority as last reported. Diagnostics. */
     val linkInfo: String = "",
+    /** The last firmware or book upload, with where its time went. Diagnostics. */
+    val lastTransfer: String? = null,
 ) {
     val connected: Boolean get() = connection == BleConnection.CONNECTED
 
@@ -330,8 +361,12 @@ data class UiState(
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
-        /** Coalesce upload progress to roughly 100 UI updates per book. */
-        const val PROGRESS_STEP_BYTES = 32 * 1024L
+        /** [TransferProgress.owner]s with a fixed name. Books are "book:<filename>". */
+        const val OWNER_FIRMWARE = "firmware"
+        const val OWNER_STORE = "store"
+        const val OWNER_CALIBRE = "calibre"
+        const val OWNER_SETTINGS = "settings"
+        const val OWNER_CRASH = "crash"
 
         /** A sync that found nothing to do this soon after one that did leaves that one on the bar. */
         const val SYNC_SUMMARY_HOLD_MS = 60_000L
@@ -496,6 +531,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
+        // Every upload's timing: into the running sync's trace, and the big ones
+        // into Diagnostics even when no sync is running (a firmware send waits for
+        // the sync to end, so its trace has closed by then).
+        ble.onUploadTimed = { t -> viewModelScope.launch { recordUpload(t) } }
         store.attach(viewModelScope)
         superviseLink()
         pollFirmware()
@@ -541,11 +580,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             ble.connection.collect { c ->
+                if (c != BleConnection.CONNECTED) dropReaderTransfers()
                 val s = _state.value
                 _state.value = s.copy(
                     connection = c,
                     authorized = if (c == BleConnection.CONNECTED) s.authorized else false,
-                    transfer = if (c == BleConnection.CONNECTED) s.transfer else null,
                     storeActivity = if (c == BleConnection.CONNECTED) s.storeActivity else null,
                     readerOpenBook = if (c == BleConnection.CONNECTED) s.readerOpenBook else null,
                     link = when (c) {
@@ -1120,6 +1159,74 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // --- transfer bar ------------------------------------------------------------
+
+    /**
+     * Transfers in flight, by owner, in the order they started. [UiState.transfer]
+     * is one of them. Main thread only.
+     *
+     * One slot written by everyone was what made the bar jump: a firmware
+     * download beside a sync had its bar replaced by each book's progress and
+     * then CLEARED when the book ended (or when a Store request went idle), so
+     * the bar fell back to the sync line until the next download step put it
+     * back.
+     */
+    private val transfers = LinkedHashMap<String, TransferProgress>()
+
+    /**
+     * The one to show: a firmware image once it has a size holds the bar for its
+     * whole download and send; a Calibre refresh and a firmware send still waiting
+     * on the sync give way to anything else; otherwise the one that started first,
+     * so a later job does not push a running bar aside.
+     */
+    private fun shownTransfer(): TransferProgress? = transfers.values.maxByOrNull { p ->
+        when {
+            p.owner == OWNER_FIRMWARE -> if (p.total > 0) 2 else 0
+            p.owner == OWNER_CALIBRE -> 0
+            else -> 1
+        }
+    }
+
+    /**
+     * Shows or updates [p] under its owner; [also] rides in the same state write.
+     * Locked because book and Calibre downloads report from an IO thread; their
+     * reports are synchronous, so none can land after the owner's [endTransfer].
+     */
+    private fun showTransfer(p: TransferProgress, also: (UiState) -> UiState = { it }) = synchronized(transfers) {
+        transfers[p.owner] = p
+        _state.value = also(_state.value.copy(transfer = shownTransfer()))
+    }
+
+    /** Ends [owner]'s transfer and only that one; the bar goes back to whatever else is running. */
+    private fun endTransfer(owner: String, also: (UiState) -> UiState = { it }) = synchronized(transfers) {
+        transfers.remove(owner)
+        _state.value = also(_state.value.copy(transfer = shownTransfer()))
+    }
+
+    /**
+     * The link is gone: Bluetooth-only transfers cannot still be running. Each
+     * ends itself as it fails; this is the backstop. Phone-side downloads (a
+     * firmware image, a book, Calibre) carry on without the reader.
+     */
+    private fun dropReaderTransfers() = synchronized(transfers) {
+        transfers.keys.removeAll { it == OWNER_STORE || it == OWNER_SETTINGS || it == OWNER_CRASH || it.startsWith("book:") }
+        _state.value = _state.value.copy(transfer = shownTransfer())
+    }
+
+    /** [BleClient.onUploadTimed]: a trace step, and the Diagnostics line for a book or firmware. */
+    private fun recordUpload(t: BleClient.UploadTiming) {
+        val name = "upload " + t.kind
+        activeTrace?.let {
+            it.add(name, t.startedAt, t.totalMs, t.bytes, t.note())
+            publishTrace(it)
+        }
+        if (t.kind == "firmware" || t.kind == "book") {
+            _state.value = _state.value.copy(
+                lastTransfer = SyncTrace.clockLine(t.startedAt, name, t.bytes, t.totalMs, t.note()),
+            )
+        }
+    }
+
     // --- sync trace -------------------------------------------------------------
 
     /** What was shown before the running trace took over; put back if it records nothing. */
@@ -1295,9 +1402,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnectReader() = viewModelScope.launch {
         ble.disconnect()
+        dropReaderTransfers()
         _state.value = _state.value.copy(
             authorized = false,
-            transfer = null,
             storeActivity = null,
             link = LinkStatus(LinkStage.IDLE),
         )
@@ -1815,7 +1922,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
         when (event) {
             is StoreEvent.Idle ->
-                _state.value = _state.value.copy(storeActivity = null, transfer = null)
+                endTransfer(OWNER_STORE) { it.copy(storeActivity = null) }
 
             is StoreEvent.Serving ->
                 _state.value = _state.value.copy(
@@ -1823,23 +1930,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
 
             is StoreEvent.Progress ->
-                _state.value = _state.value.copy(
-                    transfer = TransferProgress(event.label, event.sent, event.total)
-                )
+                showTransfer(TransferProgress(event.label, event.sent, event.total, owner = OWNER_STORE))
 
             is StoreEvent.Answered ->
-                _state.value = _state.value.copy(
-                    storeActivity = null,
-                    transfer = null,
-                    message = "Sent ${event.detail} to the reader's Store",
-                )
+                endTransfer(OWNER_STORE) {
+                    it.copy(storeActivity = null, message = "Sent ${event.detail} to the reader's Store")
+                }
 
             is StoreEvent.Declined ->
-                _state.value = _state.value.copy(
-                    storeActivity = null,
-                    transfer = null,
-                    message = "Told the reader we could not answer: ${event.reason}",
-                )
+                endTransfer(OWNER_STORE) {
+                    it.copy(storeActivity = null, message = "Told the reader we could not answer: ${event.reason}")
+                }
         }
     }
 
@@ -2789,7 +2890,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 markBusy(feed.id, false)
             }
         }
-        if (_state.value.transfer?.label == CALIBRE_LABEL) _state.value = _state.value.copy(transfer = null)
+        endTransfer(OWNER_CALIBRE)
         if (updated > 0) {
             _state.value = _state.value.copy(
                 message = if (updated == 1) "Updated \"${changed.first().title}\" from Calibre"
@@ -2804,12 +2905,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val CALIBRE_LABEL = "Updating from Calibre…"
 
-    /** The bar shows a Calibre download only when no reader transfer is using it. */
+    private val calibreGate = ProgressGate()
+
+    /** The bar shows a Calibre download only when no other transfer is using it; see [shownTransfer]. */
     private fun showCalibreProgress(sent: Long, total: Long) {
-        val current = _state.value.transfer
-        if (current == null || current.label == CALIBRE_LABEL) {
-            _state.value = _state.value.copy(transfer = TransferProgress(CALIBRE_LABEL, sent, total))
-        }
+        if (sent > 0 && !calibreGate.due(sent, total)) return
+        showTransfer(TransferProgress(CALIBRE_LABEL, sent, total, owner = OWNER_CALIBRE))
     }
 
     private var calibreJob: Job? = null
@@ -3262,22 +3363,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // The transfer bar covers the DOWNLOAD too, not just the BLE push. The
         // download is the longer half on a big book, and showing nothing for it
         // makes saving look stalled until the reader transfer begins.
-        _state.value = _state.value.copy(
-            transfer = TransferProgress("Downloading \"${row.book.title}\"", 0, 0)
-        )
+        val owner = "download:" + row.book.id
+        showTransfer(TransferProgress("Downloading \"${row.book.title}\"", 0, 0, owner = owner))
+        val gate = ProgressGate()
         val r = runCatching {
             OpdsClient(http, c.opdsUrl, c.username, c.password)
                 .download(row.book, books.fileFor(row.book)) { sent, total ->
-                    _state.value = _state.value.copy(
-                        transfer = TransferProgress(
-                            "Downloading \"${row.book.title}\"",
-                            sent,
-                            // A server with no Content-Length gives -1; report
-                            // the bytes so far as the total so the bar stays
-                            // honest rather than pretending to know the end.
-                            if (total > 0) total else sent,
-                        )
-                    )
+                    // A server with no Content-Length gives -1; report
+                    // the bytes so far as the total so the bar stays
+                    // honest rather than pretending to know the end.
+                    val end = if (total > 0) total else sent
+                    if (gate.due(sent, end)) {
+                        showTransfer(TransferProgress("Downloading \"${row.book.title}\"", sent, end, owner = owner))
+                    }
                 }
             // Only after the bytes landed: the sidecar must never describe a
             // book that is not actually on the shelf.
@@ -3285,10 +3383,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             "Saved \"${row.book.title}\" for offline reading"
         }
         markBusy(row.book.id, false)
-        _state.value = _state.value.copy(
-            transfer = null,
-            message = r.getOrElse { it.message ?: "Download failed" },
-        )
+        endTransfer(owner) { it.copy(message = r.getOrElse { e -> e.message ?: "Download failed" }) }
         if (r.isSuccess) {
             // Pending from the moment the bytes are on the phone, so the row is
             // grey for the whole gap before the reader has it.
@@ -3510,23 +3605,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Timestamp of a position sent with the book; 0 when none was.
         var positionStamp = 0L
         var replacing = false
+        val owner = "book:" + row.book.filename
+        val sending = "Sending \"${row.book.title}\" to reader…"
         val outcome = runCatching {
             // The local copy doubles as the offline library and as the source
             // for handing the book to KOReader, so it is kept, not deleted.
             val target = books.fileFor(row.book)
             if (!books.isCached(row.book)) {
-                _state.value = _state.value.copy(
-                    transfer = TransferProgress("Downloading \"${row.book.title}\"", 0, 0)
-                )
+                showTransfer(TransferProgress("Downloading \"${row.book.title}\"", 0, 0, owner = owner))
                 OpdsClient(http, c.opdsUrl, c.username, c.password).download(row.book, target)
                 // Same rule as cacheBook: describe it only once it is really
                 // on the shelf, since this path fills the shelf too.
                 books.remember(row.book)
             }
-            _state.value = _state.value.copy(
-                transfer = TransferProgress("Transferring: ${row.book.title}", 0, target.length())
-            )
-            var lastShown = 0L
+            showTransfer(TransferProgress(sending, 0, target.length(), owner = owner))
+            var gate = ProgressGate()
             replacing = row.book.filename in replaceOnSend.load(deviceKey())
             // An owed resume rides with the book where the reader can take it, so
             // the very first open lands on it. Not on a replace: the reader may
@@ -3542,11 +3635,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val onProgress: (Long, Long) -> Unit = { sent, total ->
                 // Every call, so the meter has samples between the bar's updates.
                 val kbps = meter.kbps(sent)
-                if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
-                    lastShown = sent
-                    _state.value = _state.value.copy(
-                        transfer = TransferProgress("Transferring: ${row.book.title}", sent, total, kbps)
-                    )
+                if (gate.due(sent, total)) {
+                    showTransfer(TransferProgress(sending, sent, total, kbps, owner = owner))
                 }
             }
             positionStamp = if (owedHere != null) System.currentTimeMillis() / 1000 else 0L
@@ -3570,7 +3660,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // The book matters more: send it bare, and the position sync delivers.
                 if (positionStamp == 0L || e.code != "invalid position") throw e
                 positionStamp = 0L
-                lastShown = 0L
+                gate = ProgressGate()
                 meter = RateMeter()
                 traced<BleClient.UploadResult>(traceName, bytes = { it.bytes }) {
                     ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
@@ -3630,7 +3720,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         markBusy(row.book.id, false)
-        _state.value = _state.value.copy(transfer = null, message = message)
+        endTransfer(owner) { it.copy(message = message) }
         // Deliberately neither refresh() nor loadLibrary(): the only thing that
         // changed is the "sent" flag (and, on the download-first path, the
         // shelf), and both of the heavier calls would run once per book through
@@ -3660,10 +3750,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = _state.value.copy(message = "This reader has no crash report to send")
             return@launch
         }
-        _state.value = _state.value.copy(transfer = TransferProgress("Crash report", 0, 0))
+        showTransfer(TransferProgress("Crash report", 0, 0, owner = OWNER_CRASH))
         val outcome = runCatching { ble.download("crash_report") }
+        endTransfer(OWNER_CRASH)
         _state.value = _state.value.copy(
-            transfer = null,
             message = outcome.fold(
                 onSuccess = { bytes ->
                     books.writeDiagnostic("crash_report.txt", bytes)
@@ -3684,27 +3774,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             resumeFirmwareVersion = version
             _state.value = _state.value.copy(firmwareProgress = FirmwareProgress(version, FirmwarePhase.SENDING))
         }
-        _state.value = _state.value.copy(transfer = TransferProgress(displayName, 0, staged.length()))
-        var lastShown = 0L
+        val label = if (version != null) "Sending firmware $version to reader…" else "Sending $displayName to reader…"
+        showTransfer(TransferProgress(label, 0, staged.length(), owner = OWNER_FIRMWARE))
+        val gate = ProgressGate()
         val meter = RateMeter()
         val outcome = runCatching {
             ble.upload(staged, name = "firmware.bin", kind = "firmware", version = version, signature = signature) { sent, total ->
+                // Every call, so the meter has samples between the bar's updates.
                 val kbps = meter.kbps(sent)
-                if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
-                    lastShown = sent
-                    _state.value = _state.value.copy(
-                        transfer = TransferProgress(displayName, sent, total, kbps),
-                        firmwareProgress = _state.value.firmwareProgress?.let { p ->
-                            if (total > 0) p.copy(percent = (sent * 100 / total).toInt(), kbps = kbps) else p
-                        },
-                    )
+                if (gate.due(sent, total)) {
+                    val p = TransferProgress(label, sent, total, kbps, owner = OWNER_FIRMWARE)
+                    showTransfer(p) { s ->
+                        s.copy(firmwareProgress = s.firmwareProgress?.copy(percent = p.percent, kbps = kbps))
+                    }
                 }
             }
         }
         staged.delete()
 
+        endTransfer(OWNER_FIRMWARE)
         _state.value = _state.value.copy(
-            transfer = null,
             message = outcome.fold(
                 onSuccess = { result ->
                     // A rejected image comes back as finalState "error", not as a
@@ -3957,10 +4046,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val url = "$base/${m.file}"
         val target = File(getApplication<Application>().cacheDir, "firmware-latest.bin")
         val label = "Firmware ${m.version}"
-        _state.value = _state.value.copy(
-            transfer = TransferProgress("Downloading $label", 0, m.size),
-            firmwareProgress = FirmwareProgress(m.version, FirmwarePhase.DOWNLOADING),
-        )
+        val downloading = "Downloading firmware ${m.version}…"
+        showTransfer(TransferProgress(downloading, 0, m.size, owner = OWNER_FIRMWARE)) {
+            it.copy(firmwareProgress = FirmwareProgress(m.version, FirmwarePhase.DOWNLOADING))
+        }
         val fetched = runCatching {
             withContext(Dispatchers.IO) {
                 http.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { r ->
@@ -3970,7 +4059,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     HttpGuard.checkDeclared(r, cap, "Firmware image")
                     val digest = java.security.MessageDigest.getInstance("SHA-256")
                     var total = 0L
-                    var shown = 0L
+                    val gate = ProgressGate()
+                    val meter = RateMeter()
                     r.body!!.byteStream().use { input ->
                         target.outputStream().use { out ->
                             val buf = ByteArray(64 * 1024)
@@ -3981,15 +4071,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                                 if (total > cap) throw HttpGuard.TooLarge("Firmware image")
                                 out.write(buf, 0, n)
                                 digest.update(buf, 0, n)
-                                if (total - shown >= PROGRESS_STEP_BYTES) {
-                                    shown = total
+                                val kbps = meter.kbps(total)
+                                // Checked here, so a skipped update costs no thread hop.
+                                if (gate.due(total, m.size)) {
+                                    val p = TransferProgress(downloading, total, m.size, kbps, owner = OWNER_FIRMWARE)
                                     withContext(Dispatchers.Main) {
-                                        _state.value = _state.value.copy(
-                                            transfer = TransferProgress("Downloading $label", total, m.size),
-                                            firmwareProgress = FirmwareProgress(
-                                                m.version, FirmwarePhase.DOWNLOADING, (total * 100 / m.size).toInt(),
-                                            ),
-                                        )
+                                        showTransfer(p) {
+                                            it.copy(
+                                                firmwareProgress = FirmwareProgress(
+                                                    m.version, FirmwarePhase.DOWNLOADING, p.percent, kbps,
+                                                ),
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -4005,19 +4098,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (fetched.isFailure) {
             target.delete()
-            _state.value = _state.value.copy(
-                transfer = null,
-                firmwareProgress = null,
-                message = "Could not download $label: ${fetched.exceptionOrNull()?.message}",
-            )
+            endTransfer(OWNER_FIRMWARE) {
+                it.copy(
+                    firmwareProgress = null,
+                    message = "Could not download $label: ${fetched.exceptionOrNull()?.message}",
+                )
+            }
             return@launch
         }
         // The phone-side download runs at once; the radio waits for the connect sync
-        // so the book listing is not queued behind 4.6 MB of firmware.
-        _state.value = _state.value.copy(
-            transfer = null,
-            firmwareProgress = FirmwareProgress(m.version, FirmwarePhase.SENDING),
-        )
+        // so the book listing is not queued behind 4.6 MB of firmware. The bar says
+        // what comes next rather than dropping back to the sync line; with no size
+        // yet it gives way to the sync's own sends (see shownTransfer).
+        showTransfer(TransferProgress("Sending firmware ${m.version} to reader…", 0, 0, owner = OWNER_FIRMWARE)) {
+            it.copy(firmwareProgress = FirmwareProgress(m.version, FirmwarePhase.SENDING))
+        }
         syncJob?.join()
         uploadFirmware(target, label, m.version, m.signature)
     }
@@ -4235,17 +4330,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val bytes = payload.toString().toByteArray(Charsets.UTF_8)
 
         setDeviceSettings(ui.copy(saving = true, notice = null))
-        _state.value = _state.value.copy(
-            transfer = TransferProgress("Reader settings", 0, bytes.size.toLong())
-        )
+        showTransfer(TransferProgress("Reader settings", 0, bytes.size.toLong(), owner = OWNER_SETTINGS))
         val outcome = runCatching {
             ble.uploadBytes(bytes, kind = "settings") { sent, total ->
-                _state.value = _state.value.copy(
-                    transfer = TransferProgress("Reader settings", sent, total)
-                )
+                showTransfer(TransferProgress("Reader settings", sent, total, owner = OWNER_SETTINGS))
             }
         }
-        _state.value = _state.value.copy(transfer = null)
+        endTransfer(OWNER_SETTINGS)
 
         outcome.fold(
             onSuccess = { result ->

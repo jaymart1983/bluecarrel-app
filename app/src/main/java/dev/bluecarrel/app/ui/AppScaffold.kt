@@ -55,6 +55,7 @@ import dev.bluecarrel.app.FirmwareProgress
 import dev.bluecarrel.app.MainViewModel
 import dev.bluecarrel.app.ReaderScan
 import dev.bluecarrel.app.TransferProgress
+import dev.bluecarrel.app.transferRate
 import dev.bluecarrel.app.UiState
 import dev.bluecarrel.app.data.BlePermissions
 import dev.bluecarrel.app.data.DiscoveredReader
@@ -86,7 +87,6 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.sp
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -213,7 +213,11 @@ fun AppScaffold(vm: MainViewModel) {
                 // to read while it runs.
                 SyncSummaryBar(state.lastSync!!)
             }
-            if (state.loading && !state.syncingLibrary) LinearProgressIndicator(Modifier.fillMaxWidth())
+            // Not under a transfer bar either: it has its own, and a second one
+            // coming and going below it moved the whole list.
+            if (state.loading && !state.syncingLibrary && state.transfer == null) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
 
             // Two surfaces. The Library is the shelf the reader mirrors; the Store
             // is the whole Calibre library, which is searched rather than listed
@@ -697,14 +701,22 @@ private fun ReaderStatusAction(
  *  usable" is the one thing on this bar that should read the same either way. */
 private val READER_CONNECTED = Color(0xFF2E9E4F)
 
-/** What the pill, the menu and the Firmware screen say about an update in flight. */
-private fun firmwareProgressLabel(p: FirmwareProgress): String = when (p.phase) {
-    FirmwarePhase.DOWNLOADING -> "Downloading firmware ${p.percent}%"
-    FirmwarePhase.SENDING ->
-        if (p.percent == 0 && p.kbps == 0) "Sending ${p.version} to the reader"
-        else "Sending ${p.version} ${p.percent}% · ${p.kbps} KB/s"
-    FirmwarePhase.INSTALLING -> "Sent to reader, waiting on install"
-    FirmwarePhase.SCHEDULED -> "${p.version} installs when the reader sleeps"
+/**
+ * What the pill, the menu and the Firmware screen say about an update in flight:
+ * "Downloading firmware · 45% · 1.2 MB/s", "Sending to reader · 45% · 31 KB/s".
+ * The rate is left off until it is known.
+ */
+private fun firmwareProgressLabel(p: FirmwareProgress): String {
+    fun moving(what: String) = buildString {
+        append(what).append(" · ").append(p.percent).append('%')
+        if (p.kbps > 0) append(" · ").append(transferRate(p.kbps))
+    }
+    return when (p.phase) {
+        FirmwarePhase.DOWNLOADING -> moving("Downloading firmware")
+        FirmwarePhase.SENDING -> moving("Sending to reader")
+        FirmwarePhase.INSTALLING -> "Sent to reader, waiting on install"
+        FirmwarePhase.SCHEDULED -> "${p.version} installs when the reader sleeps"
+    }
 }
 
 /** The sync glyph: turning while [spinning] (bytes moving), pulsing while [pulsing] (waiting). */
@@ -923,13 +935,15 @@ private fun TransferBar(t: TransferProgress) {
                 Spacer(Modifier.width(12.dp))
                 // Percent first: the question being asked is "how far along". A
                 // send adds its rate, which says whether minutes remain.
+                // Tabular figures, so "11%" is as wide as "88%" and the title
+                // beside it does not shuffle on every update.
                 Text(
                     when {
                         t.total <= 0 -> "…"
-                        t.kbps > 0 -> "${(t.fraction * 100).roundToInt()}% · ${t.kbps} KB/s"
-                        else -> "${(t.fraction * 100).roundToInt()}%"
+                        t.kbps > 0 -> "${t.percent}% · ${transferRate(t.kbps)}"
+                        else -> "${t.percent}%"
                     },
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"),
                     maxLines = 1,
                 )
             }
@@ -1724,6 +1738,7 @@ private fun SettingsSheet(
                             append("last auth attempt:\n").append(state.authTrace)
                             append("\nstore:\n").append(state.storeTrace)
                             append("\n\nlink: ").append(state.linkInfo.ifBlank { "-" })
+                            append("\n\nlast transfer:\n").append(state.lastTransfer ?: "none yet")
                             append("\n\nlast sync:\n")
                             append(state.syncTrace.joinToString("\n").ifBlank { "none yet" })
                             append("\n\nsync before:\n")

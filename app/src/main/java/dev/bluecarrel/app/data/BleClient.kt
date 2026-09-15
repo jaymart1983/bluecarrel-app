@@ -357,6 +357,13 @@ class BleClient(private val context: Context) {
     var phy: String? = null
         private set
 
+    /**
+     * Where each upload's time went, once it ends (done or failed). Called on the
+     * uploading coroutine's thread.
+     */
+    @Volatile
+    var onUploadTimed: ((UploadTiming) -> Unit)? = null
+
     /** The ATT MTU negotiated for this link. */
     val negotiatedMtu: Int get() = mtu
 
@@ -1416,6 +1423,42 @@ class BleClient(private val context: Context) {
     )
 
     /**
+     * One upload's timing, for the trace. [writeMs] is time blocked in data-in
+     * writes (each waits for the stack's onCharacteristicWrite); [creditMs] is
+     * time waiting for the reader's `received` to catch up, [creditWaits] times.
+     */
+    data class UploadTiming(
+        val kind: String,
+        /** Wall clock at start_put. */
+        val startedAt: Long,
+        /** Bytes actually written, which is less than the file on a failure. */
+        val bytes: Long,
+        val totalMs: Long,
+        val chunk: Int,
+        val frames: Long,
+        val writeMs: Long,
+        val creditWaits: Int,
+        val creditMs: Long,
+        val commitMs: Long,
+        val mtu: Int,
+        val phy: String?,
+        val priorityHigh: Boolean,
+        val error: String?,
+    ) {
+        /** "frame 500 ×9346 · writes 120.0 s · credit waits 195×, 25.0 s · commit 900 ms · mtu 517 · …" */
+        fun note(): String = buildString {
+            append("frame ").append(chunk).append(" ×").append(frames)
+            append(" · writes ").append(SyncTrace.duration(writeMs))
+            append(" · credit waits ").append(creditWaits).append("×, ").append(SyncTrace.duration(creditMs))
+            append(" · commit ").append(SyncTrace.duration(commitMs))
+            append(" · mtu ").append(mtu)
+            append(" · phy ").append(phy ?: "?")
+            append(" · priority ").append(if (priorityHigh) "high" else "balanced")
+            if (error != null) append(" · failed: ").append(error.take(60))
+        }
+    }
+
+    /**
      * Streams [file] to the reader as [kind] under [name].
      *
      * [onProgress] is called with bytes the reader has *acknowledged* where a
@@ -1547,6 +1590,16 @@ class BleClient(private val context: Context) {
         if (signature != null) startPut.put("signature", signature)
         if (position != null) startPut.put("position", position)
 
+        // Timing for the trace: nanoTime around the two waits, a few ns per frame.
+        val t0 = System.nanoTime()
+        var sequence = 0L
+        var sent = 0L
+        var writeNs = 0L
+        var creditNs = 0L
+        var creditWaits = 0
+        var commitNs = 0L
+        var failure: Throwable? = null
+
         holdFastLink()
         try {
             val ready = commandAwait(startPut, 15_000) {
@@ -1554,8 +1607,6 @@ class BleClient(private val context: Context) {
             }
             failIfError(ready)
 
-            var sequence = 0L
-            var sent = 0L
             var lastCredit = 0L
             val buffer = ByteArray(chunk)
 
@@ -1571,25 +1622,35 @@ class BleClient(private val context: Context) {
                     ByteBuffer.wrap(frame, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
                         .putInt(sequence.toInt())
                     System.arraycopy(buffer, 0, frame, FRAME_HEADER_BYTES, n)
+                    val w = System.nanoTime()
                     writeChar(dataInChar, frame, withoutResponse = true)
+                    writeNs += System.nanoTime() - w
                     sequence += 1
                     sent += n
                     onProgress(sent, total)
 
                     if (sent - lastCredit >= ACK_BYTES) {
                         lastCredit = sent
+                        val c = System.nanoTime()
                         awaitReceived(lastCredit)
+                        creditNs += System.nanoTime() - c
+                        creditWaits++
                         onProgress(sent, total)
                     }
                 }
             }
             if (sent != total) throw BleException("Read $sent of $total bytes from local storage")
 
+            val c = System.nanoTime()
             awaitReceived(total)
+            creditNs += System.nanoTime() - c
+            creditWaits++
 
+            val k = System.nanoTime()
             val committed = commandAwait(
                 JSONObject().put("op", "commit"), COMMIT_TIMEOUT_MS, commitDone,
             )
+            commitNs = System.nanoTime() - k
             failIfError(committed)
 
             return UploadResult(
@@ -1600,12 +1661,30 @@ class BleClient(private val context: Context) {
                 positionApplied = position != null && readPositionApplied(committed),
             )
         } catch (e: Throwable) {
+            failure = e
             // Best effort: if the link is already gone this just fails again,
             // and the reader drops its own partial ".ble-" staging file.
             runCatching { writeControl(JSONObject().put("op", "cancel")) }
             throw e
         } finally {
             releaseFastLink()
+            val timing = UploadTiming(
+                kind = kind,
+                startedAt = started,
+                bytes = sent,
+                totalMs = (System.nanoTime() - t0) / 1_000_000,
+                chunk = chunk,
+                frames = sequence,
+                writeMs = writeNs / 1_000_000,
+                creditWaits = creditWaits,
+                creditMs = creditNs / 1_000_000,
+                commitMs = commitNs / 1_000_000,
+                mtu = mtu,
+                phy = phy,
+                priorityHigh = priorityHigh,
+                error = failure?.let { if (it is CancellationException) "cancelled" else it.message ?: it.javaClass.simpleName },
+            )
+            runCatching { onUploadTimed?.invoke(timing) }
         }
     }
 

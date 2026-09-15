@@ -335,7 +335,7 @@ class StoreResponder(
         ble.upload(target, name, kind = "book", req = request.req) { sent, _ ->
             if (sent - lastShown >= 32 * 1024L || sent == total) {
                 lastShown = sent
-                onEvent(StoreEvent.Progress("Sending \"${book.title}\"", sent, total))
+                onEvent(StoreEvent.Progress("Sending \"${book.title}\" to reader…", sent, total))
             }
         }
         onEvent(StoreEvent.Answered(request.op, book.title))

@@ -53,16 +53,9 @@ class SyncTrace(val startedAt: Long = System.currentTimeMillis()) {
         return listOf(head) + snapshot.map(::lineFor)
     }
 
-    private fun lineFor(s: Step): String = buildString {
-        append(String.format(Locale.US, "%+.1f ", (s.startedAt - startedAt) / 1000.0))
-        append(s.name)
-        if (s.bytes > 0L) append(' ').append(size(s.bytes))
-        if (s.durationMs > 0L || s.bytes > 0L) append(' ').append(duration(s.durationMs))
-        if (s.bytes > 0L && s.durationMs > 0L) {
-            append(' ').append(String.format(Locale.US, "%.1f KB/s", s.bytes * 1000.0 / s.durationMs / 1024.0))
-        }
-        if (s.note.isNotBlank()) append("  ").append(s.note)
-    }
+    private fun lineFor(s: Step): String =
+        String.format(Locale.US, "%+.1f ", (s.startedAt - startedAt) / 1000.0) +
+            stepText(s.name, s.bytes, s.durationMs, s.note)
 
     companion object {
         private const val MAX_STEPS = 150
@@ -70,8 +63,26 @@ class SyncTrace(val startedAt: Long = System.currentTimeMillis()) {
         fun duration(ms: Long): String =
             if (ms < 1000L) "$ms ms" else String.format(Locale.US, "%.1f s", ms / 1000.0)
 
-        fun size(bytes: Long): String =
-            if (bytes < 1024L) "$bytes B" else String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+        fun size(bytes: Long): String = when {
+            bytes < 1024L -> "$bytes B"
+            bytes < 1024L * 1024L -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+            else -> String.format(Locale.US, "%.1f MB", bytes / 1048576.0)
+        }
+
+        /** One step without its offset: "upload firmware 4.5 MB 150.0 s 30.0 KB/s  frame 500 ×9346". */
+        fun stepText(name: String, bytes: Long, durationMs: Long, note: String): String = buildString {
+            append(name)
+            if (bytes > 0L) append(' ').append(size(bytes))
+            if (durationMs > 0L || bytes > 0L) append(' ').append(duration(durationMs))
+            if (bytes > 0L && durationMs > 0L) {
+                append(' ').append(String.format(Locale.US, "%.1f KB/s", bytes * 1000.0 / durationMs / 1024.0))
+            }
+            if (note.isNotBlank()) append("  ").append(note)
+        }
+
+        /** A step outside any sync, with its clock time: the Diagnostics "last transfer" line. */
+        fun clockLine(at: Long, name: String, bytes: Long, durationMs: Long, note: String): String =
+            SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(at)) + " " + stepText(name, bytes, durationMs, note)
     }
 }
 
