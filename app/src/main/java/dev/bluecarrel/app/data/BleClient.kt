@@ -1481,7 +1481,9 @@ class BleClient(private val context: Context) {
     /**
      * One upload's timing, for the trace. [writeMs] is time blocked in data-in
      * writes (each waits for the stack's onCharacteristicWrite); [creditMs] is
-     * time waiting for the reader's `received` to catch up, [creditWaits] times.
+     * time waiting for the reader's `received` to catch up, [creditWaits] times:
+     * each wait runs from a window's last write to the status that covers it,
+     * [creditMaxMs] the longest.
      */
     data class UploadTiming(
         val kind: String,
@@ -1495,17 +1497,19 @@ class BleClient(private val context: Context) {
         val writeMs: Long,
         val creditWaits: Int,
         val creditMs: Long,
+        val creditMaxMs: Long,
         val commitMs: Long,
         val mtu: Int,
         val phy: String?,
         val priorityHigh: Boolean,
         val error: String?,
     ) {
-        /** "frame 500 ×9346 · writes 120.0 s · credit waits 195×, 25.0 s · commit 900 ms · mtu 517 · …" */
+        /** "frame 500 ×9346 · writes 120.0 s · credit waits 195×, 25.0 s (max 1.2 s) · commit 900 ms · mtu 517 · …" */
         fun note(): String = buildString {
             append("frame ").append(chunk).append(" ×").append(frames)
             append(" · writes ").append(SyncTrace.duration(writeMs))
             append(" · credit waits ").append(creditWaits).append("×, ").append(SyncTrace.duration(creditMs))
+            append(" (max ").append(SyncTrace.duration(creditMaxMs)).append(")")
             append(" · commit ").append(SyncTrace.duration(commitMs))
             append(" · mtu ").append(mtu)
             append(" · phy ").append(phy ?: "?")
@@ -1660,6 +1664,7 @@ class BleClient(private val context: Context) {
         var sent = 0L
         var writeNs = 0L
         var creditNs = 0L
+        var creditMaxNs = 0L
         var creditWaits = 0
         var commitNs = 0L
         var failure: Throwable? = null
@@ -1697,7 +1702,9 @@ class BleClient(private val context: Context) {
                         lastCredit = sent
                         val c = System.nanoTime()
                         awaitReceived(lastCredit)
-                        creditNs += System.nanoTime() - c
+                        val waited = System.nanoTime() - c
+                        creditNs += waited
+                        creditMaxNs = maxOf(creditMaxNs, waited)
                         creditWaits++
                         onProgress(sent, total)
                     }
@@ -1707,7 +1714,9 @@ class BleClient(private val context: Context) {
 
             val c = System.nanoTime()
             awaitReceived(total)
-            creditNs += System.nanoTime() - c
+            val waited = System.nanoTime() - c
+            creditNs += waited
+            creditMaxNs = maxOf(creditMaxNs, waited)
             creditWaits++
 
             val k = System.nanoTime()
@@ -1742,6 +1751,7 @@ class BleClient(private val context: Context) {
                 writeMs = writeNs / 1_000_000,
                 creditWaits = creditWaits,
                 creditMs = creditNs / 1_000_000,
+                creditMaxMs = creditMaxNs / 1_000_000,
                 commitMs = commitNs / 1_000_000,
                 mtu = mtu,
                 phy = phy,

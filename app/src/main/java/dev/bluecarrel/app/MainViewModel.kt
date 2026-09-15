@@ -1345,10 +1345,65 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             publishTrace(it)
         }
         if (t.kind == "firmware" || t.kind == "book") {
-            _state.value = _state.value.copy(
-                lastTransfer = SyncTrace.clockLine(t.startedAt, name, t.bytes, t.totalMs, t.note()),
-            )
+            val line = SyncTrace.clockLine(t.startedAt, name, t.bytes, t.totalMs, t.note())
+            _state.value = _state.value.copy(lastTransfer = line)
+            // The reader's own measurements of the same upload, read while the link is up.
+            if (t.error == null && _state.value.connected && _state.value.authorized) {
+                viewModelScope.launch { appendReaderUploadStats(line, t) }
+            }
         }
+    }
+
+    /** Appends the reader's `about` link and last_upload numbers to [line] while it is still the one shown. */
+    private suspend fun appendReaderUploadStats(line: String, t: BleClient.UploadTiming) {
+        val about = readAbout(fresh = true).getOrNull() ?: return
+        val note = readerUploadNote(about, t) ?: return
+        if (_state.value.lastTransfer == line) {
+            _state.value = _state.value.copy(lastTransfer = "$line · reader: $note")
+        }
+    }
+
+    /**
+     * "itvl 15 ms, dl 251/251, phy 2M, msys min 2, queue 40, sd 3.1 s, loop 4.0 s, gap 180 ms,
+     * 62/s avg 70/s max, …" from `about`. `last_upload` counts only when it is this upload
+     * (same kind and bytes). Null when the firmware reports neither.
+     */
+    private fun readerUploadNote(about: JSONObject, t: BleClient.UploadTiming): String? {
+        val parts = mutableListOf<String>()
+        about.optJSONObject("link")?.let { l ->
+            if (l.has("interval_ms")) {
+                val itvl = l.optDouble("interval_ms")
+                parts += "itvl " + (if (itvl % 1.0 == 0.0) itvl.toLong().toString() else itvl.toString()) + " ms"
+            }
+            if (l.has("tx_octets") && l.has("rx_octets")) {
+                parts += "dl ${l.optInt("tx_octets")}/${l.optInt("rx_octets")}" +
+                    if (l.optBoolean("dl_reported", true)) "" else " (default)"
+            }
+            l.optString("phy").ifBlank { null }?.let { parts += "phy $it" }
+        }
+        val u = about.optJSONObject("last_upload")
+            ?.takeIf { it.optString("kind") == t.kind && it.optLong("bytes", -1L) == t.bytes }
+        if (u != null) {
+            fun ms(key: String) = SyncTrace.duration(u.optLong(key))
+            if (u.has("min_msys_free")) parts += "msys min ${u.optInt("min_msys_free")}"
+            if (u.has("min_acl_free")) parts += "acl min ${u.optInt("min_acl_free")}"
+            if (u.has("max_queue")) parts += "queue ${u.optInt("max_queue")}"
+            if (u.has("sd_ms")) parts += "sd ${ms("sd_ms")}"
+            if (u.has("loop_ms")) parts += "loop ${ms("loop_ms")}"
+            if (u.has("max_gap_ms")) parts += "gap ${ms("max_gap_ms")}"
+            if (u.has("frames_per_s_avg") && u.has("frames_per_s_max")) {
+                parts += "${u.optInt("frames_per_s_avg")}/s avg ${u.optInt("frames_per_s_max")}/s max"
+            }
+            if (u.has("ack_notify_avg_ms")) {
+                parts += "ack→notify avg ${ms("ack_notify_avg_ms")} max ${ms("ack_notify_max_ms")}"
+            }
+            if (u.has("tick_gap_max_ms")) parts += "tick gap ${ms("tick_gap_max_ms")}"
+            if (u.has("renders")) parts += "renders ${u.optInt("renders")} (${ms("render_ms")})"
+            val failed = u.optInt("notify_failed")
+            val shed = u.optInt("ack_shed")
+            if (failed > 0 || shed > 0) parts += "notify failed $failed, shed $shed"
+        }
+        return parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
     }
 
     // --- sync trace -------------------------------------------------------------
