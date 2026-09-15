@@ -517,6 +517,77 @@ class SentBooksStore(private val context: Context) {
     }
 }
 
+/**
+ * Which Calibre book each file on a reader is, and what that reader last listed.
+ *
+ * Links are reader filename -> Calibre UUID, per reader. A filename is derived
+ * from title and author, so a Calibre rename gives the same book a new name; the
+ * UUID does not move, so a book relinked after a reinstall (or linked by hand)
+ * still maps to its Calibre record afterwards.
+ *
+ * The listing is the reader's last `library` download, trimmed to what the
+ * Library needs to draw books that are on the reader but not on this phone. Kept
+ * so those rows are there at launch, before the reader has connected.
+ */
+class BookLinkStore(private val context: Context) {
+
+    private fun linksKey(deviceId: String?) = stringPreferencesKey("book_links_" + (deviceId ?: "unknown"))
+    private fun listingKey(deviceId: String?) = stringPreferencesKey("reader_listing_" + (deviceId ?: "unknown"))
+
+    suspend fun load(deviceId: String?): Map<String, String> =
+        context.dataStore.data.map { decodeLinks(it[linksKey(deviceId)]) }.first()
+
+    suspend fun put(deviceId: String?, filename: String, uuid: String) {
+        val safe = calibreUuidOrNull(uuid) ?: return
+        context.dataStore.edit { p ->
+            val k = linksKey(deviceId)
+            val all = decodeLinks(p[k])
+            if (all[filename] != safe) p[k] = org.json.JSONObject((all + (filename to safe)) as Map<*, *>).toString()
+        }
+    }
+
+    suspend fun listing(deviceId: String?): List<org.json.JSONObject> =
+        context.dataStore.data.map { p ->
+            runCatching {
+                val arr = org.json.JSONArray(p[listingKey(deviceId)] ?: "[]")
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+            }.getOrDefault(emptyList())
+        }.first()
+
+    suspend fun saveListing(deviceId: String?, entries: List<org.json.JSONObject>) {
+        val arr = org.json.JSONArray()
+        for (e in entries.take(LISTING_MAX)) {
+            val name = e.optString("filename").ifBlank { null } ?: continue
+            arr.put(org.json.JSONObject().apply {
+                put("filename", name)
+                for (f in LISTING_STRINGS) e.optString(f).takeIf { it.isNotBlank() }?.let { put(f, it.take(160)) }
+                if (e.has("size")) put("size", e.optLong("size"))
+                if (e.has("percent")) put("percent", e.optDouble("percent"))
+                if (e.has("timestamp")) put("timestamp", e.optLong("timestamp"))
+                if (e.has("fromApp")) put("fromApp", e.optBoolean("fromApp", true))
+            })
+        }
+        context.dataStore.edit { it[listingKey(deviceId)] = arr.toString() }
+    }
+
+    /** A book the reader no longer holds, taken out of the kept listing. */
+    suspend fun dropFromListing(deviceId: String?, filename: String) {
+        val kept = listing(deviceId)
+        if (kept.none { it.optString("filename") == filename }) return
+        saveListing(deviceId, kept.filter { it.optString("filename") != filename })
+    }
+
+    private fun decodeLinks(raw: String?): Map<String, String> = runCatching {
+        val o = org.json.JSONObject(raw ?: return emptyMap())
+        o.keys().asSequence().mapNotNull { k -> calibreUuidOrNull(o.optString(k))?.let { k to it } }.toMap()
+    }.getOrDefault(emptyMap())
+
+    private companion object {
+        const val LISTING_MAX = 500
+        val LISTING_STRINGS = listOf("title", "author", "calibre_uuid")
+    }
+}
+
 /** The last sync's summary, so the sync bar can still say how it went after a restart. */
 class LastSyncStore(private val context: Context) {
 

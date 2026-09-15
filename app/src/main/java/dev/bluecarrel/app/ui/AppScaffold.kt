@@ -52,6 +52,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.bluecarrel.app.AppTab
 import dev.bluecarrel.app.FirmwarePhase
 import dev.bluecarrel.app.FirmwareProgress
+import dev.bluecarrel.app.LinkPicker
 import dev.bluecarrel.app.MainViewModel
 import dev.bluecarrel.app.ReaderScan
 import dev.bluecarrel.app.TransferProgress
@@ -59,6 +60,7 @@ import dev.bluecarrel.app.transferRate
 import dev.bluecarrel.app.UiState
 import dev.bluecarrel.app.data.BlePermissions
 import dev.bluecarrel.app.data.DiscoveredReader
+import dev.bluecarrel.app.data.Book
 import dev.bluecarrel.app.data.BookRow
 import dev.bluecarrel.app.data.ResumePrompt
 import dev.bluecarrel.app.data.SyncSummary
@@ -129,6 +131,10 @@ fun AppScaffold(vm: MainViewModel) {
             state.link.stage == LinkStage.NEEDS_PAIRING -> showPairing = true
             else -> Unit
         }
+    }
+    // A pairing started without a tap in the picker (a bonded reader found) closes it.
+    LaunchedEffect(state.pairingReaderName) {
+        if (state.pairingReaderName != null) showPairing = false
     }
 
     Scaffold(
@@ -281,7 +287,9 @@ fun AppScaffold(vm: MainViewModel) {
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(shown, key = { it.book.id }) { row ->
+                    // Id AND filename: a book on the reader only is keyed by its filename, and
+                    // the shelf can hold one Calibre book under two names.
+                    items(shown, key = { it.book.id + "|" + it.book.filename }) { row ->
                         BookItem(
                             row = row,
                             readingNow = state.readerOpenBook != null && state.readerOpenBook == row.book.filename,
@@ -389,6 +397,10 @@ fun AppScaffold(vm: MainViewModel) {
             onCache = { vm.cacheBook(detailRow) },
             onRemove = { vm.removeOffline(detailRow) },
             onOpen = { vm.openInReader(detailRow) },
+            canAddToCalibre = "book_download" in state.readerFeatures && state.config.serverConfigured,
+            onLink = { detailOf = null; vm.openLinkPicker(detailRow) },
+            onAddToCalibre = { vm.addToCalibre(detailRow) },
+            onRemoveFromReader = { detailOf = null; vm.removeFromReader(detailRow) },
         )
     } else if (detailOf != null) {
         // The book left both lists while the sheet was open (removed offline
@@ -412,6 +424,33 @@ fun AppScaffold(vm: MainViewModel) {
                 showPairing = false
                 vm.pairReader(reader.address, reader.name)
             },
+        )
+    }
+
+    state.linkPicker?.let { p ->
+        LinkPickerDialog(
+            picker = p,
+            onQuery = { vm.setLinkQuery(it) },
+            onSearch = { vm.searchLinkPicker() },
+            onPick = { vm.linkToCalibre(p.filename, it) },
+            onDismiss = { vm.dismissLinkPicker() },
+        )
+    }
+
+    if (state.pairingConfirm) {
+        AlertDialog(
+            onDismissRequest = { },
+            icon = { Icon(BluetoothVector, null) },
+            title = { Text("Pair a reader") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text("Confirm on the reader", style = MaterialTheme.typography.bodyMedium)
+                }
+            },
+            confirmButton = { },
+            dismissButton = { TextButton(onClick = { vm.cancelPairing() }) { Text("Cancel") } },
         )
     }
 
@@ -1212,12 +1251,13 @@ private fun BookItem(
                 // Said in words, not only in grey. A tint is a weak signal for
                 // something the user is explicitly waiting on; a line of text
                 // either appears or it does not.
-                if (removing || owed || pending || onReader) {
+                if (removing || owed || pending || onReader || row.onReaderOnly) {
                     Text(
                         when {
                             removing -> "Removing from reader…"
                             owed -> "Will be removed on next device sync"
                             pending -> "Waiting to send to reader…"
+                            row.onReaderOnly -> "On reader"
                             else -> "On the reader"
                         },
                         style = MaterialTheme.typography.labelSmall,
@@ -1256,14 +1296,23 @@ private fun BookItem(
         // reader -- the ViewModel runs the mirror straight after a successful
         // save -- so there is no separate send.
         trailingContent = {
-            OfflineToggle(
-                row = row,
-                busy = busy,
-                removing = removing || owed,
-                openOnReader = readingNow,
-                onCache = onCache,
-                onRemove = onRemove,
-            )
+            // A book only on the reader has nothing to save or remove here; its sheet has its actions.
+            if (row.onReaderOnly) {
+                if (busy) {
+                    Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    }
+                }
+            } else {
+                OfflineToggle(
+                    row = row,
+                    busy = busy,
+                    removing = removing || owed,
+                    openOnReader = readingNow,
+                    onCache = onCache,
+                    onRemove = onRemove,
+                )
+            }
         },
     )
 }
@@ -1351,8 +1400,14 @@ private fun BookDetailSheet(
     onCache: () -> Unit,
     onRemove: () -> Unit,
     onOpen: () -> Unit,
+    /** Reader-only rows: the reader can send the book back and Calibre is set up. */
+    canAddToCalibre: Boolean = false,
+    onLink: () -> Unit = {},
+    onAddToCalibre: () -> Unit = {},
+    onRemoveFromReader: () -> Unit = {},
 ) {
     val book = row.book
+    var confirmReaderRemove by remember { mutableStateOf(false) }
     // A PackageManager query, so it is asked once per book and re-asked only
     // when the book's saved state changes (an unsaved book has no file, hence
     // no intent to resolve, hence no handler).
@@ -1373,6 +1428,15 @@ private fun BookDetailSheet(
                     Text(book.title, style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(4.dp))
                     Text(book.author, style = MaterialTheme.typography.bodyMedium)
+                    if (row.onReaderOnly) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "On reader",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     if (book.seriesLabel.isNotBlank()) {
                         Spacer(Modifier.height(4.dp))
                         Text(
@@ -1407,6 +1471,10 @@ private fun BookDetailSheet(
                         Spacer(Modifier.width(8.dp))
                         Text("Working…")
                     }
+                } else if (row.onReaderOnly) {
+                    Button(onClick = onLink, modifier = Modifier.weight(1f)) {
+                        Text("Link to Calibre book")
+                    }
                 } else if (row.cached) {
                     OutlinedButton(
                         onClick = onRemove,
@@ -1425,7 +1493,17 @@ private fun BookDetailSheet(
                 }
             }
 
-            OutlinedButton(
+            if (row.onReaderOnly && !busy) {
+                if (canAddToCalibre) {
+                    OutlinedButton(onClick = onAddToCalibre, modifier = Modifier.fillMaxWidth()) {
+                        Text("Add to Calibre")
+                    }
+                }
+                TextButton(onClick = { confirmReaderRemove = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Remove from reader")
+                }
+            }
+            if (!row.onReaderOnly) OutlinedButton(
                 // Two separate reasons to be unavailable, and the label says
                 // which: a book that is not on the phone has nothing to open,
                 // and a phone with no EPUB viewer has nothing to open it with.
@@ -1470,6 +1548,82 @@ private fun BookDetailSheet(
             }
         }
     }
+
+    if (confirmReaderRemove) {
+        AlertDialog(
+            onDismissRequest = { confirmReaderRemove = false },
+            icon = { Icon(Icons.Default.Delete, null) },
+            title = { Text("Remove from the reader?") },
+            text = {
+                Text(
+                    "Deletes \"${book.title}\" from the reader on the next sync.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmReaderRemove = false; onRemoveFromReader() }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmReaderRemove = false }) { Text("Keep") }
+            },
+        )
+    }
+}
+
+/**
+ * "Link to Calibre book": search Calibre and pick the book a reader-only file is.
+ * The pick is downloaded under the reader's filename and not sent again.
+ */
+@Composable
+private fun LinkPickerDialog(
+    picker: LinkPicker,
+    onQuery: (String) -> Unit,
+    onSearch: () -> Unit,
+    onPick: (Book) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Link to Calibre book") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = picker.query,
+                    onValueChange = onQuery,
+                    label = { Text("Search Calibre") },
+                    singleLine = true,
+                    trailingIcon = {
+                        IconButton(onClick = onSearch) { Icon(Icons.Filled.Search, contentDescription = "Search") }
+                    },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { onSearch() }),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (picker.searching) LinearProgressIndicator(Modifier.fillMaxWidth())
+                picker.note?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                    picker.results.forEach { b ->
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onPick(b) }
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                        ) {
+                            Text(b.title, style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                b.author,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 /** A metadata row, or nothing at all when Calibre had no value for it. */

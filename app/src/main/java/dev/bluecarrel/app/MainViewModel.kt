@@ -28,7 +28,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -167,6 +169,19 @@ data class FirmwareProgress(
     val kbps: Int = 0,
 )
 
+/**
+ * "Link to Calibre book" for a book only on the reader: the reader's [filename],
+ * the search box and what it found.
+ */
+data class LinkPicker(
+    val filename: String,
+    val title: String,
+    val query: String,
+    val searching: Boolean = false,
+    val results: List<Book> = emptyList(),
+    val note: String? = null,
+)
+
 /** A one-line outcome shown on the reader-settings screen. */
 data class SettingsNotice(val text: String, val isError: Boolean)
 
@@ -296,6 +311,12 @@ data class UiState(
     val pairingReaderName: String? = null,
     /** The pairing picker's scan, while the picker is open; null when it is closed. */
     val readerScan: ReaderScan? = null,
+    /** The reader is showing its "allow this phone?" screen for a pairing in flight. */
+    val pairingConfirm: Boolean = false,
+    /** `features` from the reader's last `about` document. Empty until read. */
+    val readerFeatures: Set<String> = emptySet(),
+    /** The "Link to Calibre book" picker, while open. */
+    val linkPicker: LinkPicker? = null,
     val permissionsGranted: Boolean = true,
     val transfer: TransferProgress? = null,
 
@@ -414,6 +435,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val FORGOTTEN_HINT = "Remove the reader in Bluetooth settings, then pair again"
         /** Reader auth_error codes that mean it has no record of this phone. */
         val FORGOTTEN_CODES = setOf("unknown trusted host", "invalid trusted host auth")
+
+        /** Book ids of Library rows for books only on the reader: this plus the reader filename. */
+        const val READER_ROW = "reader:"
+        /** `about` features: the reader takes and lists `calibre_uuid`; it sends a book back. */
+        const val BOOK_UUID = "book_uuid"
+        const val BOOK_DOWNLOAD = "book_download"
+        /** Calibre downloads at once while relinking reader books. */
+        const val RELINK_PARALLEL = 2
+        /** After an upload to Calibre, how often and how long to look for the imported book. */
+        const val ADD_POLL_MS = 20_000L
+        const val ADD_WAIT_MS = 5 * 60_000L
+        /** A bonded reader seen by the picker is paired straight away once no second one shows in this time. */
+        const val AUTO_PAIR_SETTLE_MS = 1_500L
+        const val CONFIRM_ON_READER_TEXT = "Confirm on the reader"
+        const val PAIRING_DECLINED_TEXT = "Pairing was declined on the reader"
     }
 
     private val settings = SettingsStore(app)
@@ -534,6 +570,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private val transfers = LinkedHashMap<String, TransferProgress>()
     private val calibreGate = ProgressGate()
+
+    // --- reader books without a shelf copy ----------------------------------------
+    // Above init like the rest: loadLibrary (called from init) reads bookLinks, and
+    // the status collector can reach a sync pass, which starts a relink.
+
+    /** Reader filename -> Calibre UUID, and the reader's last listing. */
+    private val bookLinks = BookLinkStore(app)
+    /** The catalogue as the last refresh() loaded it, before any shelf aliasing. Relinks match against it. */
+    private var catalogueBooks: List<Book> = emptyList()
+    private var relinkJob: Job? = null
+    private var relinkAgain = false
+    /** Reader filenames being fetched from Calibre onto the shelf. */
+    private val relinking = mutableSetOf<String>()
+    /** Reader filenames already looked up by a Calibre search this process, so a miss is searched once. */
+    private val relinkSearched = mutableSetOf<String>()
+    private val relinkLimit = Semaphore(RELINK_PARALLEL)
+    /** Reader filenames being pulled off the reader and uploaded to Calibre. */
+    private val addingToCalibre = mutableSetOf<String>()
+    /** Uploaded, not yet seen in the catalogue: reader filename -> (title, author). */
+    private val calibreAddsPending = mutableMapOf<String, Pair<String, String>>()
+    /** Bonded readers the picker already paired with on its own this process; never twice. */
+    private val autoPairTried = mutableSetOf<String>()
+    private var autoPairJob: Job? = null
 
     init {
         app.registerComponentCallbacks(configWatcher)
@@ -933,6 +992,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pairingStore.clear()
         ReaderPresence.unregister(getApplication())
         ble.disconnect()
+        invalidateReaderListing()
+        loadLibrary(withProgress = false)
         val link = LinkStatus(LinkStage.NEEDS_PAIRING, "The reader forgot this phone", FORGOTTEN_HINT)
         _state.value = _state.value.copy(
             hasStoredPairing = false,
@@ -971,6 +1032,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         _state.value = _state.value.copy(readerScan = ReaderScan(scanning = true))
+        // Android keeps its bond through an app reinstall. A reader it is bonded with
+        // that is advertising now is the one this phone paired with before.
+        val bonded = ble.bondedAddresses()
         scanJob = viewModelScope.launch {
             var error: String? = null
             try {
@@ -978,6 +1042,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val scan = _state.value.readerScan
                     if (generation == scanGeneration && scan != null) {
                         _state.value = _state.value.copy(readerScan = scan.copy(readers = readers))
+                        if (bonded.isNotEmpty()) pairBondedReader(readers, bonded, generation)
                     }
                 }
             } catch (e: CancellationException) {
@@ -990,6 +1055,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     _state.value = _state.value.copy(readerScan = scan.copy(scanning = false, error = error))
                 }
             }
+        }
+    }
+
+    /**
+     * Skips the picker when the scan finds exactly one reader this phone is still
+     * bonded with: pairs with it directly. Waits [AUTO_PAIR_SETTLE_MS] for a second
+     * bonded reader first, and with two leaves the choice to the user. A reader is
+     * tried this way once per process, so a failed attempt does not repeat when the
+     * picker opens again.
+     */
+    private fun pairBondedReader(readers: List<DiscoveredReader>, bonded: Set<String>, generation: Int) {
+        if (autoPairJob?.isActive == true) return
+        if (readers.none { it.address in bonded && it.address !in autoPairTried }) return
+        autoPairJob = viewModelScope.launch {
+            delay(AUTO_PAIR_SETTLE_MS)
+            if (generation != scanGeneration) return@launch
+            val only = _state.value.readerScan?.readers.orEmpty()
+                .filter { it.address in bonded && it.address !in autoPairTried }
+                .singleOrNull() ?: return@launch
+            autoPairTried += only.address
+            pairReader(only.address, only.name)
         }
     }
 
@@ -1047,22 +1133,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     )
                     return@launch
                 }
-                if (!status.pairingWindow) {
-                    ble.disconnect()
-                    _state.value = _state.value.copy(
-                        link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_CLOSED_HINT),
-                        lastAuthError = ble.lastAuthError,
-                    )
-                    return@launch
-                }
-
                 _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
                 val identity = pairingStore.mint().copy(deviceId = deviceId, address = connectedTo)
+                // Sent with the pairing window closed too: a reader with `pair_prompt`
+                // then asks its user, and older firmware refuses with "pairing window
+                // closed", which reads exactly as before.
                 // pair() returns only when the reader confirmed paired == true; anything
                 // else throws, and no hello is sent after an unconfirmed pair.
-                runCatching { ble.pair(identity) }.exceptionOrNull()?.let { e ->
+                val paired = try {
+                    ble.pair(identity, onConfirmOnReader = {
+                        _state.value = _state.value.copy(
+                            pairingConfirm = true,
+                            link = LinkStatus(LinkStage.PAIRING, reason = CONFIRM_ON_READER_TEXT),
+                        )
+                    })
+                    null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    e
+                }
+                if (_state.value.pairingConfirm) _state.value = _state.value.copy(pairingConfirm = false)
+                paired?.let { e ->
                     ble.disconnect()
-                    failLink(e, silent = false)
+                    when ((e as? BleClient.BleException)?.code) {
+                        "pairing window closed" -> _state.value = _state.value.copy(
+                            link = LinkStatus(LinkStage.NEEDS_PAIRING, reason = "Pairing is closed on the reader", hint = PAIR_CLOSED_HINT),
+                            lastAuthError = ble.lastAuthError,
+                        )
+                        BleClient.PAIRING_DENIED -> _state.value = _state.value.copy(
+                            authorized = false,
+                            authTrace = ble.lastAuthTrace,
+                            lastAuthError = ble.lastAuthError,
+                            link = LinkStatus(LinkStage.FAILED, reason = PAIRING_DECLINED_TEXT, hint = PAIR_HINT),
+                            message = PAIRING_DECLINED_TEXT,
+                        )
+                        else -> failLink(e, silent = false)
+                    }
                     return@launch
                 }
                 val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
@@ -1105,11 +1212,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 startConnectedWork()
             } finally {
                 pairingInProgress = false
-                if (_state.value.pairingReaderName != null) {
-                    _state.value = _state.value.copy(pairingReaderName = null)
+                if (_state.value.pairingReaderName != null || _state.value.pairingConfirm) {
+                    _state.value = _state.value.copy(pairingReaderName = null, pairingConfirm = false)
                 }
             }
         }.also { connectJob = it }
+    }
+
+    /** Cancel on the "Confirm on the reader" dialog: stop waiting and drop the link. */
+    fun cancelPairing() {
+        if (!pairingInProgress) return
+        connectJob?.cancel()
+        ble.disconnect()
+        _state.value = _state.value.copy(
+            pairingConfirm = false,
+            pairingReaderName = null,
+            link = LinkStatus(LinkStage.IDLE),
+        )
     }
 
     /** Permission and radio checks before any scan. False when the link cannot start. */
@@ -1214,7 +1333,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * firmware image, a book, Calibre) carry on without the reader.
      */
     private fun dropReaderTransfers() = synchronized(transfers) {
-        transfers.keys.removeAll { it == OWNER_STORE || it == OWNER_SETTINGS || it == OWNER_CRASH || it.startsWith("book:") }
+        transfers.keys.removeAll { it == OWNER_STORE || it == OWNER_SETTINGS || it == OWNER_CRASH || it.startsWith("book:") || it.startsWith("pull:") }
         _state.value = _state.value.copy(transfer = shownTransfer())
     }
 
@@ -1433,6 +1552,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { pairingStore.clear() }
         ReaderPresence.unregister(getApplication())
         ble.disconnect()
+        invalidateReaderListing()
+        loadLibrary(withProgress = false)
         linkFailStreak = 0
         _state.value = _state.value.copy(
             hasStoredPairing = false,
@@ -1982,7 +2103,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        result.onSuccess { feedBooks ->
+        result.onSuccess { fetched ->
+            catalogueBooks = fetched
+            // A book the shelf holds under another name (a relinked reader file, or a
+            // Calibre rename) is the same book: it is shown and updated under that name.
+            val feedBooks = aliasToShelf(fetched)
             val kosync = KosyncClient(http, c.kosyncUrl, c.username, c.password)
             val cachedNames = books.cachedNames()
             val sent = sentBooks.load(deviceKey())
@@ -2038,6 +2163,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The shelf does not come from the feed, but a catalogue refresh is
             // a good moment to pick up reading progress the reader has synced.
             loadLibrary()
+            // Reader books with no shelf copy, matched against what just loaded.
+            settleCalibreAdds(fetched)
+            startRelink()
             // Warm the reader's two geometries now, off the critical path. Not
             // gated on the reader being connected: the point is to be ready
             // before it asks, and it may ask seconds after it connects.
@@ -2088,7 +2216,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val sent = sentBooks.load(deviceKey())
                 _state.value.copy(
                     searching = false,
-                    rows = list.map { book ->
+                    rows = aliasToShelf(list).map { book ->
                         BookRow(
                             book = book,
                             // Hashing every search hit would mean opening each
@@ -2166,7 +2294,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        val rows = saved.map { book ->
+        // Books on the reader with no copy here: from this session's listing, or the
+        // one kept from the last, so they show before the reader has connected.
+        val shelfNames = saved.map { it.filename }.toSet()
+        val listing = readerEntries?.map { JSONObject(it.toString()) }
+            ?: runCatching { bookLinks.listing(deviceKey()) }.getOrDefault(emptyList())
+        val onlyOnReader = listing.mapNotNull { e ->
+            val name = e.optString("filename").ifBlank { null } ?: return@mapNotNull null
+            if (name in shelfNames) null else readerOnlyRow(e, name, name in owed, known[name])
+        }.distinctBy { it.book.filename }
+        val rows = (saved.map { book ->
             BookRow(
                 book = book,
                 progress = if (fetched.containsKey(book.filename)) fetched[book.filename] else known[book.filename],
@@ -2174,7 +2311,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 cached = true,
                 pendingRemoval = book.filename in owed,
             )
-        }.sortedWith(
+        } + onlyOnReader).sortedWith(
             // Books on their way out sink to the bottom -- they are leaving, so
             // they should not sit above books the user is actually keeping.
             compareBy<BookRow> { row -> row.pendingRemoval }.thenByDescending { row ->
@@ -2201,7 +2338,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun restampRows() {
         val cachedNames = withContext(Dispatchers.IO) { books.cachedNames() }
         val sent = sentBooks.load(deviceKey())
-        fun stamp(row: BookRow) = row.copy(
+        fun stamp(row: BookRow) = if (row.onReaderOnly) row else row.copy(
             cached = cachedNames.contains(row.book.filename),
             sentFromThisApp = row.book.filename in sent,
         )
@@ -2225,7 +2362,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // the reader does not depend on how far it has been read.
         loadLibrary(withProgress = false).join()
         // Not a book still coming down from Calibre: its file is not final yet.
-        val pending = libraryRows().filter { !it.sentFromThisApp && it.book.filename !in calibreUpdating }
+        val pending = libraryRows().filter {
+            !it.onReaderOnly && !it.sentFromThisApp && it.book.filename !in calibreUpdating && it.book.filename !in relinking
+        }
         // Covers come from Calibre, so they are fetched beside the sends, never ahead of them.
         warmCovers(pending.map { it.book })
         var sentAny = false
@@ -2374,6 +2513,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (settings) runCatching { loadDeviceSettings(force = true).join() }
 
         val sentAny = mirrorPass()
+        // The listing is in hand now: fetch Calibre's copy of reader books the shelf lacks, beside the sync.
+        startRelink()
 
         // Positions when the pass was a full one or something was just sent, not
         // on every small trigger: a page-turn-driven pass has nothing to add.
@@ -2508,15 +2649,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Whether this reader applies a `position` sent with a book: `book_position`
      * in the `about` document's `features`, read once per connection.
      */
-    private suspend fun readerTakesBookPosition(): Boolean {
-        aboutFeatures?.let { return BOOK_POSITION in it }
+    private suspend fun readerTakesBookPosition(): Boolean = readerHasFeature(BOOK_POSITION)
+
+    /** [feature] is in this connection's `about` `features`, read once per connection. */
+    private suspend fun readerHasFeature(feature: String): Boolean {
+        aboutFeatures?.let { return feature in it }
         val doc = readAbout(fresh = false)
         // Firmware without the `about` kind has no features either. Any other
         // failure (a dropped link) is not an answer, so it is not cached.
         if ((doc.exceptionOrNull() as? BleClient.BleException)?.code == "unsupported transfer kind") {
             aboutFeatures = emptySet()
         }
-        return aboutFeatures?.contains(BOOK_POSITION) == true
+        return aboutFeatures?.contains(feature) == true
     }
 
     /**
@@ -2547,6 +2691,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val features = if (arr == null) emptySet()
         else (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }.toSet()
         aboutFeatures = features
+        if (_state.value.readerFeatures != features) _state.value = _state.value.copy(readerFeatures = features)
         // Downloads after this one may use bigger frames and fewer acks. Both absent
         // on older firmware, which keeps 160 bytes and an ack per frame.
         ble.setDownloadCapabilities(
@@ -3080,6 +3225,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         readerEntries = parsed.map { JSONObject(it.toString()) }.toMutableList()
         readerEntriesAt = System.currentTimeMillis()
         readerPositionsStale = false
+        runCatching { bookLinks.saveListing(deviceKey(), parsed) }
         return parsed
     }
 
@@ -3092,10 +3238,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** A book this app just removed from the reader. */
-    private fun listingRemove(filename: String) {
+    /** A book this app just removed from the reader. The kept copy too, or its row would come back. */
+    private suspend fun listingRemove(filename: String) {
         libraryEchoUntil = System.currentTimeMillis() + LIBRARY_ECHO_MS
         readerEntries?.removeAll { it.optString("filename") == filename }
+        runCatching { bookLinks.dropFromListing(deviceKey(), filename) }
     }
 
     /** A position the reader reported applied. */
@@ -3192,7 +3339,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 message = "Kept $kept book${if (kept == 1) "" else "s"} already on the reader",
             )
         }
-        if (gone.isNotEmpty() || settled > 0) loadLibrary(withProgress = false)
+        // Also when the books only on the reader are not the ones the Library shows.
+        val readerOnlyNow = onDevice.filter { it !in shelf && it !in owed && it !in gone }.toSet()
+        val readerOnlyShown = _state.value.library.filter { it.onReaderOnly && !it.pendingRemoval }
+            .map { it.book.filename }.toSet()
+        if (gone.isNotEmpty() || settled > 0 || readerOnlyNow != readerOnlyShown) loadLibrary(withProgress = false)
         return gone.size
     }
 
@@ -3266,7 +3417,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
         }.getOrNull()
 
+        val uuid = calibreUuidOrNull(book.progressKey)?.takeIf { readerHasFeature(BOOK_UUID) }
         val item = CatalogContainer.Item(
+            calibreUuid = uuid.orEmpty(),
             id = book.id,
             title = book.title,
             author = book.author,
@@ -3646,6 +3799,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             positionStamp = if (owedHere != null) System.currentTimeMillis() / 1000 else 0L
+            // The Calibre UUID rides with the book where the reader keeps it, so the
+            // book can be matched to Calibre again whatever its filename becomes.
+            val calibreUuid = calibreUuidOrNull(row.book.progressKey)?.takeIf { readerHasFeature(BOOK_UUID) }
             val traceName = "book " + row.book.title.take(24)
             try {
                 traced<BleClient.UploadResult>(
@@ -3658,6 +3814,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         row.book.filename,
                         replace = replacing,
                         position = owedHere?.positionJson(positionStamp),
+                        calibreUuid = calibreUuid,
                         onProgress = onProgress,
                     )
                 }
@@ -3669,7 +3826,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 gate = ProgressGate()
                 meter = RateMeter()
                 traced<BleClient.UploadResult>(traceName, bytes = { it.bytes }) {
-                    ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
+                    ble.upload(target, row.book.filename, replace = replacing, calibreUuid = calibreUuid, onProgress = onProgress)
                 }
             }
         }
@@ -3745,6 +3902,408 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!replacing && !(positionStamp > 0L && sent.positionApplied)) {
             deliverOwedResumeNow(row.book.filename)
         }
+    }
+
+    // ------------------------------------------------- reader books, relinked
+
+    /**
+     * [list] with each book the shelf already holds under another filename renamed
+     * to that filename, matched by Calibre UUID. That is a reader file relinked
+     * after a reinstall (kept under the READER's name) or a book Calibre renamed
+     * since it was saved: the same book either way, so the Store shows it as saved
+     * and a Calibre update replaces the copy the shelf and the reader actually have.
+     */
+    private suspend fun aliasToShelf(list: List<Book>): List<Book> {
+        val shelf = withContext(Dispatchers.IO) { books.cachedBooks() }
+        if (shelf.isEmpty()) return list
+        val names = shelf.map { it.filename }.toSet()
+        val byKey = HashMap<String, String>()
+        for (b in shelf) b.progressKey?.let { byKey.putIfAbsent(it, b.filename) }
+        return list.map { b ->
+            val alias = b.progressKey?.let { byKey[it] }
+            if (alias == null || alias == b.filename || b.filename in names) b else b.copy(filename = alias)
+        }
+    }
+
+    /** A Library row for a book on the reader with no copy here, described by the reader's listing. */
+    private fun readerOnlyRow(e: JSONObject, name: String, owedRemoval: Boolean, known: Progress?): BookRow {
+        val pct = e.optDouble("percent", -1.0).toFloat()
+        val savedAt = e.optLong("timestamp", 0L)
+        val listed = if (pct > 0f) {
+            Progress(document = name, percentage = pct.coerceIn(0f, 1f), device = kosyncDeviceName(), timestamp = savedAt)
+        } else null
+        // A heartbeat since the listing was read is the newer number.
+        val progress = if (known != null && (listed == null || known.timestamp >= listed.timestamp)) known else listed
+        val title = e.optString("title").trim().ifBlank { null }
+            ?: name.removeSuffix(".epub").replace(Regex("[-_]+"), " ").trim().ifBlank { name }
+        return BookRow(
+            book = Book(
+                id = READER_ROW + name,
+                title = title,
+                author = e.optString("author").trim().ifBlank { "Unknown" },
+                downloadUrl = null,
+                coverUrl = null,
+                filename = name,
+                sizeBytes = e.optLong("size", 0L).coerceAtLeast(0L),
+            ),
+            progress = progress,
+            sentFromThisApp = true,
+            cached = false,
+            pendingRemoval = owedRemoval,
+            onReaderOnly = true,
+        )
+    }
+
+    /**
+     * Starts [relinkPass] beside the sync for the listing in hand. One at a time; a
+     * request while one runs earns one more pass. Nothing on the reader waits on it.
+     */
+    private fun startRelink() {
+        val c = _state.value.config
+        if (!c.serverConfigured || catalogueBooks.isEmpty()) return
+        val entries = readerEntries?.map { JSONObject(it.toString()) } ?: return
+        if (relinkJob?.isActive == true) {
+            relinkAgain = true
+            return
+        }
+        val job = viewModelScope.launch {
+            runCatching { relinkPass(entries) }.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            if (relinkAgain) {
+                relinkAgain = false
+                startRelink()
+            }
+        }
+        relinkJob = job
+        trackWork(job)
+    }
+
+    /**
+     * Brings reader books the shelf lacks back onto it from Calibre.
+     *
+     * For each listing entry that is not on the shelf, not owed a removal and not
+     * already being fetched: match a catalogue book by the reader's `calibre_uuid`,
+     * then by the link remembered for that filename, then by exact filename. The
+     * catalogue is the one refresh() loaded; an entry it does not cover is looked
+     * up once per process with a Calibre search by title. A match is downloaded
+     * under the READER's filename (see [linkOnShelf]), so the shelf, the sent and
+     * removal records and the reader's own position reports all line up, and it
+     * is marked sent so the mirror never sends it back.
+     *
+     * Only books the reader says came from the app (or that carry a UUID): a USB
+     * side-load has no Calibre original, and stays a reader-only row.
+     */
+    private suspend fun relinkPass(entries: List<JSONObject>): Int {
+        val c = _state.value.config
+        val readerId = deviceKey()
+        val shelf = withContext(Dispatchers.IO) { books.cachedNames() }
+        val owed = pendingRemovals.load(readerId)
+        val links = bookLinks.load(readerId)
+        val candidates = entries.filter { e ->
+            val name = e.optString("filename")
+            name.isNotBlank() && name !in shelf && name !in owed && name !in relinking && name !in addingToCalibre &&
+                name !in calibreAddsPending &&
+                (e.optBoolean("fromApp", true) || calibreUuidOrNull(e.optString("calibre_uuid")) != null)
+        }
+        if (candidates.isEmpty()) return 0
+
+        val catalogue = catalogueBooks
+        val byKey = HashMap<String, Book>()
+        val byName = HashMap<String, Book>()
+        for (b in catalogue) {
+            b.progressKey?.let { byKey.putIfAbsent(it, b) }
+            byName.putIfAbsent(b.filename, b)
+        }
+        fun match(e: JSONObject, found: (String) -> Book?, named: (String) -> Book?): Book? {
+            val name = e.optString("filename")
+            val uuid = calibreUuidOrNull(e.optString("calibre_uuid")) ?: links[name]
+            return uuid?.let(found) ?: named(name)
+        }
+        val matches = mutableListOf<Pair<String, Book>>()
+        val misses = mutableListOf<JSONObject>()
+        for (e in candidates) {
+            val m = match(e, { byKey[it] }, { byName[it] })
+            if (m != null) matches += e.optString("filename") to m else misses += e
+        }
+        // Beyond the page the catalogue holds: one search per book per process.
+        val searchable = misses.filter { it.optString("filename") !in relinkSearched && it.optString("title").isNotBlank() }
+        if (searchable.isNotEmpty()) {
+            val opds = OpdsClient(http, c.opdsUrl, c.username, c.password)
+            for (e in searchable) {
+                val name = e.optString("filename")
+                val found = runCatching { opds.search(e.optString("title").trim()) }.getOrNull() ?: continue
+                relinkSearched += name
+                match(e, { k -> found.firstOrNull { it.progressKey == k } }, { n -> found.firstOrNull { it.filename == n } })
+                    ?.let { matches += name to it }
+            }
+        }
+        if (matches.isEmpty()) return 0
+
+        val linked = traced<Int>("relink", note = { "$it of ${matches.size} from Calibre" }) {
+            coroutineScope {
+                matches.map { (name, book) ->
+                    async { relinkLimit.withPermit { linkOnShelf(readerId, name, book) } }
+                }.awaitAll().count { it }
+            }
+        }
+        if (linked > 0) loadLibrary()
+        return linked
+    }
+
+    /**
+     * Puts Calibre's [book] on the shelf under the reader's [readerName] and links
+     * the two: the link (reader filename -> UUID) is remembered, and the book is
+     * marked sent to the reader, which already holds it. Marked sent BEFORE the
+     * file lands on the shelf, so no mirror pass can see it unsent and send it back.
+     * Downloaded beside the shelf first, so a failed download leaves nothing behind.
+     * [fallback] is used when the download fails (the copy just pulled off the reader).
+     */
+    private suspend fun linkOnShelf(
+        readerId: String?,
+        readerName: String,
+        book: Book,
+        fallback: File? = null,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): Boolean {
+        if (readerName in relinking) return false
+        relinking += readerName
+        val c = _state.value.config
+        val shelved = book.copy(filename = readerName)
+        val temp = File(getApplication<Application>().cacheDir, "relink-$readerName")
+        return try {
+            val target = books.fileFor(shelved)
+            if (!withContext(Dispatchers.IO) { target.exists() && target.length() > 0 }) {
+                val fetched = runCatching {
+                    OpdsClient(http, c.opdsUrl, c.username, c.password).download(book, temp, onProgress)
+                }
+                if (fetched.isFailure) {
+                    val copied = fallback != null && withContext(Dispatchers.IO) {
+                        runCatching { fallback.copyTo(temp, overwrite = true); temp.length() > 0 }.getOrDefault(false)
+                    }
+                    if (!copied) return false
+                }
+                sentBooks.add(readerId, readerName)
+                calibreUuidOrNull(book.progressKey)?.let { bookLinks.put(readerId, readerName, it) }
+                val moved = withContext(Dispatchers.IO) {
+                    temp.renameTo(target) || runCatching { temp.copyTo(target, overwrite = true); true }.getOrDefault(false)
+                }
+                if (!moved) return false
+            } else {
+                sentBooks.add(readerId, readerName)
+                calibreUuidOrNull(book.progressKey)?.let { bookLinks.put(readerId, readerName, it) }
+            }
+            books.remember(shelved)
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            false
+        } finally {
+            withContext(Dispatchers.IO) { temp.delete() }
+            relinking -= readerName
+        }
+    }
+
+    /** Opens "Link to Calibre book" for a book only on the reader, searching by its title. */
+    fun openLinkPicker(row: BookRow) {
+        if (!row.onReaderOnly) return
+        _state.value = _state.value.copy(
+            linkPicker = LinkPicker(filename = row.book.filename, title = row.book.title, query = row.book.title),
+        )
+        searchLinkPicker()
+    }
+
+    fun setLinkQuery(q: String) {
+        val p = _state.value.linkPicker ?: return
+        _state.value = _state.value.copy(linkPicker = p.copy(query = q))
+    }
+
+    fun dismissLinkPicker() {
+        _state.value = _state.value.copy(linkPicker = null)
+    }
+
+    /** Searches Calibre for the picker; a blank query lists the catalogue already loaded. */
+    fun searchLinkPicker() = viewModelScope.launch {
+        val p = _state.value.linkPicker ?: return@launch
+        val c = _state.value.config
+        if (!c.serverConfigured) {
+            _state.value = _state.value.copy(linkPicker = p.copy(note = "Set the server URL in Settings"))
+            return@launch
+        }
+        val q = p.query.trim()
+        _state.value = _state.value.copy(linkPicker = p.copy(searching = true, note = null))
+        val found = if (q.isEmpty()) Result.success(catalogueBooks)
+        else runCatching { OpdsClient(http, c.opdsUrl, c.username, c.password).search(q) }
+        val now = _state.value.linkPicker?.takeIf { it.filename == p.filename } ?: return@launch
+        val list = found.getOrDefault(emptyList())
+        _state.value = _state.value.copy(
+            linkPicker = now.copy(
+                searching = false,
+                results = list,
+                note = when {
+                    found.isFailure -> "Search failed"
+                    list.isEmpty() -> "Nothing matched"
+                    else -> null
+                },
+            ),
+        )
+    }
+
+    /** The user's pick: Calibre's [book] goes on the shelf as the reader's [filename]. Not sent again. */
+    fun linkToCalibre(filename: String, book: Book) = viewModelScope.launch {
+        _state.value = _state.value.copy(linkPicker = null)
+        val id = READER_ROW + filename
+        val owner = "download:$id"
+        val label = "Downloading \"${book.title}\""
+        markBusy(id, true)
+        showTransfer(TransferProgress(label, 0, 0, owner = owner))
+        val gate = ProgressGate()
+        val ok = linkOnShelf(deviceKey(), filename, book) { sent, total ->
+            val end = if (total > 0) total else sent
+            if (gate.due(sent, end)) showTransfer(TransferProgress(label, sent, end, owner = owner))
+        }
+        markBusy(id, false)
+        endTransfer(owner) {
+            it.copy(message = if (ok) "Linked to \"${book.title}\"" else "Could not download \"${book.title}\"")
+        }
+        if (ok) loadLibrary()
+    }
+
+    /**
+     * Explicit removal of a book only on the reader: owed, exactly like removing a
+     * shelved book with the reader away, and carried out by the next sync's prune.
+     */
+    fun removeFromReader(row: BookRow) = viewModelScope.launch {
+        if (!row.onReaderOnly) return@launch
+        pendingRemovals.add(deviceKey(), row.book.filename)
+        loadLibrary(withProgress = false).join()
+        _state.value = _state.value.copy(
+            message = "\"${row.book.title}\" will be removed from the reader on the next sync",
+        )
+        if (_state.value.connected && _state.value.authorized) requestSync()
+    }
+
+    /**
+     * "Add to Calibre" for a book only on the reader: pull the EPUB off the reader,
+     * upload it through CWA's web form ([CalibreUploader]), then look for the
+     * imported book every [ADD_POLL_MS] for up to [ADD_WAIT_MS] (CWA imports in the
+     * background). Found by title and author, it is linked and shelved under the
+     * reader's filename. Not found by then, the next catalogue refresh links it.
+     */
+    fun addToCalibre(row: BookRow) = viewModelScope.launch {
+        val name = row.book.filename
+        val c = _state.value.config
+        if (!row.onReaderOnly || name in addingToCalibre) return@launch
+        if (!c.serverConfigured) {
+            _state.value = _state.value.copy(message = "Set the server URL in Settings")
+            return@launch
+        }
+        if (!_state.value.connected || !_state.value.authorized) {
+            _state.value = _state.value.copy(message = "Connect to the reader first")
+            return@launch
+        }
+        if (!readerHasFeature(BOOK_DOWNLOAD)) {
+            _state.value = _state.value.copy(message = "Update the reader's firmware to add books")
+            return@launch
+        }
+        val readerId = deviceKey()
+        val id = READER_ROW + name
+        val owner = "pull:$name"
+        val temp = File(getApplication<Application>().cacheDir, "pull-$name")
+        addingToCalibre += name
+        markBusy(id, true)
+        _state.value = _state.value.copy(message = "Adding to Calibre\u2026")
+        try {
+            // 1. Off the reader, straight to a file.
+            val label = "Copying \"${row.book.title}\" from reader"
+            showTransfer(TransferProgress(label, 0, row.book.sizeBytes, owner = owner))
+            val gate = ProgressGate()
+            val meter = RateMeter()
+            val pulled = runCatching {
+                traced<ByteArray>("pull book", note = { ble.lastDownloadShape }) {
+                    withContext(Dispatchers.IO) {
+                        temp.outputStream().use { out ->
+                            ble.download("book", mapOf("name" to name), into = out, maxBytes = HttpGuard.BOOK_MAX) { got, total ->
+                                val kbps = meter.kbps(got)
+                                val end = if (total > 0) total else maxOf(got, row.book.sizeBytes)
+                                if (gate.due(got, end)) showTransfer(TransferProgress(label, got, end, kbps, owner = owner))
+                            }
+                        }
+                    }
+                }
+            }
+            endTransfer(owner)
+            if (pulled.isFailure || temp.length() == 0L) {
+                val why = (pulled.exceptionOrNull() as? BleClient.BleException)?.message
+                _state.value = _state.value.copy(message = why ?: "Could not copy the book from the reader")
+                return@launch
+            }
+
+            // 2. Up to Calibre.
+            val upload = runCatching { CalibreUploader(http, c.base, c.username, c.password).upload(temp, name) }
+            upload.exceptionOrNull()?.let { e ->
+                if (e is CancellationException) throw e
+                _state.value = _state.value.copy(
+                    message = if (e is CalibreUploader.Refused) "Calibre did not accept the book" else "Could not reach Calibre",
+                )
+                return@launch
+            }
+
+            // 3. Wait for the import, then link.
+            calibreAddsPending[name] = row.book.title to row.book.author
+            val found = awaitCalibreImport(name, row.book.title, row.book.author)
+            when {
+                found != null -> {
+                    calibreAddsPending -= name
+                    linkOnShelf(readerId, name, found, fallback = temp)
+                    _state.value = _state.value.copy(message = "Added to Calibre")
+                    loadLibrary()
+                }
+                // A catalogue refresh found and linked it meanwhile.
+                name !in calibreAddsPending -> _state.value = _state.value.copy(message = "Added to Calibre")
+                else -> _state.value = _state.value.copy(message = "Calibre has not listed the book yet")
+            }
+        } finally {
+            endTransfer(owner)
+            addingToCalibre -= name
+            markBusy(id, false)
+            withContext(Dispatchers.IO) { temp.delete() }
+        }
+    }
+
+    /** The book CWA imported from an upload, looked for every [ADD_POLL_MS] for [ADD_WAIT_MS]. */
+    private suspend fun awaitCalibreImport(name: String, title: String, author: String): Book? {
+        val c = _state.value.config
+        val opds = OpdsClient(http, c.opdsUrl, c.username, c.password)
+        val deadline = System.currentTimeMillis() + ADD_WAIT_MS
+        while (System.currentTimeMillis() < deadline) {
+            delay(ADD_POLL_MS)
+            if (name !in calibreAddsPending) return null
+            val found = runCatching { opds.search(title) }.getOrNull()?.firstOrNull { importedAs(it, title, author) }
+                ?: catalogueBooks.firstOrNull { importedAs(it, title, author) }
+            if (found != null) return found
+        }
+        return null
+    }
+
+    /** Uploads still waiting to show in the catalogue, linked once a refresh lists them. */
+    private fun settleCalibreAdds(feed: List<Book>) {
+        if (calibreAddsPending.isEmpty()) return
+        for ((name, wanted) in calibreAddsPending.toMap()) {
+            val found = feed.firstOrNull { importedAs(it, wanted.first, wanted.second) } ?: continue
+            calibreAddsPending -= name
+            trackWork(viewModelScope.launch {
+                if (linkOnShelf(deviceKey(), name, found)) loadLibrary()
+            })
+        }
+    }
+
+    /** [book] is the Calibre record of an upload titled [title] by [author]: same title, compatible author. */
+    private fun importedAs(book: Book, title: String, author: String): Boolean {
+        fun norm(v: String) = v.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+        if (norm(book.title) != norm(title) || norm(title).isEmpty()) return false
+        val want = norm(author)
+        val have = norm(book.author)
+        return want.isEmpty() || want == "unknown" || have == want || have.contains(want) || want.contains(have)
     }
 
     /**
@@ -4516,6 +5075,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun hasBackgroundWork(): Boolean =
         syncJob?.isActive == true || heartbeatWriting || heartbeatPending.isNotEmpty() ||
             kosyncJob?.isActive == true || calibreJob?.isActive == true ||
+            relinkJob?.isActive == true || addingToCalibre.isNotEmpty() ||
             _state.value.transfer != null ||
             // The reader reboots mid-install; the watch must outlive the dropped link.
             _state.value.firmwareProgress?.phase == FirmwarePhase.INSTALLING

@@ -91,6 +91,8 @@ object CatalogContainer {
         val published: String = "",
         val language: String = "",
         val tags: List<String> = emptyList(),
+        /** book_meta only, and only to a reader listing `book_uuid`. Empty omits it. */
+        val calibreUuid: String = "",
     ) {
         override fun equals(other: Any?) = this === other
         override fun hashCode() = id.hashCode()
@@ -214,6 +216,7 @@ object CatalogContainer {
             if (item.tags.isNotEmpty()) {
                 put("tags", clampUtf8(item.tags.joinToString(", "), MAX_TAGS_BYTES))
             }
+            calibreUuidOrNull(item.calibreUuid)?.let { put("calibre_uuid", it) }
         }
 
     /**

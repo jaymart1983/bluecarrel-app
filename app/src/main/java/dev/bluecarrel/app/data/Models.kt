@@ -186,7 +186,23 @@ data class BookRow(
      * leaving the pending deletion invisible.
      */
     val pendingRemoval: Boolean = false,
+    /**
+     * On the reader, and not on this phone's shelf: nothing here matched it to a
+     * Calibre book yet (a reinstall, a USB side-load). Described from the reader's
+     * own listing, never offered for Remove, and only deleted from the reader if
+     * the user asks (an owed removal, as for any other book).
+     */
+    val onReaderOnly: Boolean = false,
 )
+
+/**
+ * [raw] as the reader takes a Calibre UUID (`calibre_uuid` in start_put and
+ * book_meta): `[0-9A-Za-z-]`, 1..64 characters. Null for anything else.
+ */
+fun calibreUuidOrNull(raw: String?): String? =
+    raw?.trim()?.takeIf { CALIBRE_UUID.matches(it) }
+
+private val CALIBRE_UUID = Regex("^[0-9A-Za-z-]{1,64}$")
 
 /** Identity this phone presents to the reader. Stored only after a verified pairing. */
 data class HostIdentity(

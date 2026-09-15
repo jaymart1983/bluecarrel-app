@@ -162,6 +162,13 @@ class BleClient(private val context: Context) {
         /** The reader must speak security v2. */
         const val PROTOCOL_VERSION = 2
 
+        /** auth_error while a reader with `pair_prompt` asks its user to allow this phone. */
+        const val CONFIRM_ON_READER = "confirm on reader"
+        /** auth_error when the user declined on the reader, or its prompt timed out (60 s). */
+        const val PAIRING_DENIED = "pairing denied"
+        /** How long a pair waits on the reader's consent screen. A little over its own 60 s. */
+        private const val PAIR_PROMPT_WAIT_MS = 70_000L
+
         /** The reader rejects anything this does not match ("unsafe ... filename"). */
         private val SAFE_NAME = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
@@ -673,6 +680,16 @@ class BleClient(private val context: Context) {
     fun bluetoothEnabled(): Boolean = runCatching {
         context.getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
     }.getOrDefault(false)
+
+    /**
+     * Upper-case addresses of the devices Android is bonded with. A bond survives
+     * an app reinstall, so a reader in this set that is also advertising the
+     * service is the one this phone paired with before. Empty when unknown.
+     */
+    @SuppressLint("MissingPermission")
+    fun bondedAddresses(): Set<String> = runCatching {
+        adapter().bondedDevices.orEmpty().mapNotNull { it.address?.uppercase() }.toSet()
+    }.getOrDefault(emptySet())
 
     /**
      * Scan, connect, bond, set up.
@@ -1189,15 +1206,20 @@ class BleClient(private val context: Context) {
      *
      *     {"op":"pair","version":2,"host_id":H,"host_name":N,"secret":"<64 hex>"}
      *
-     * Sent only on a connected link Android reports BOND_BONDED, and only while
-     * the reader's status says `pairing_window`. The answer authorises nothing;
-     * the caller follows with [authenticate], whose reader_proof does.
+     * Sent only on a connected link Android reports BOND_BONDED. With the reader's
+     * pairing window open it pairs at once. With it closed, a reader that lists
+     * `pair_prompt` asks its user instead: it answers [CONFIRM_ON_READER], then
+     * `paired` once allowed or [PAIRING_DENIED]. [onConfirmOnReader] is called
+     * when that screen is up, and the answer is waited for (without resending)
+     * for [PAIR_PROMPT_WAIT_MS]. Older firmware answers "pairing window closed".
+     * The answer authorises nothing; the caller follows with [authenticate],
+     * whose reader_proof does.
      *
      * Returns only when the reader confirms `paired == true`, in the awaited
      * notification or a fresh read. Anything else throws.
      */
     @SuppressLint("MissingPermission")
-    suspend fun pair(identity: HostIdentity): DeviceStatus = authLock.withLock {
+    suspend fun pair(identity: HostIdentity, onConfirmOnReader: () -> Unit = {}): DeviceStatus = authLock.withLock {
         val trace = StringBuilder()
         fun note(s: String) { trace.append(s).append('\n'); lastAuthTrace = trace.toString().trim() }
         note("pair host=${identity.hostId.take(8)}…")
@@ -1213,11 +1235,7 @@ class BleClient(private val context: Context) {
             throw BleException("This phone is not paired with the reader", reason = Reason.BOND)
         }
         val pre = readStatus()
-        if (!pre.pairingWindow) {
-            note("pair: pairing_window=false")
-            lastAuthFailure = "pairing window closed"
-            throw BleException(friendlyError("pairing window closed"), "pairing window closed", Reason.AUTH)
-        }
+        note("pair: pairing_window=${pre.pairingWindow}")
         val command = JSONObject()
             .put("op", "pair")
             .put("version", PROTOCOL_VERSION)
@@ -1232,11 +1250,45 @@ class BleClient(private val context: Context) {
             { "paired=${it.paired} auth_error=${it.authError ?: "-"}" },
             { "timeout/err: ${it.message}" },
         ))
-        val verdict = runCatching { readStatus() }.getOrNull()
+        var verdict = runCatching { readStatus() }.getOrNull()
         note("pair verdict paired=${verdict?.paired} auth_error=${verdict?.authError ?: "-"}")
         if (verdict != null && verdict.paired) return@withLock verdict
         if (awaited != null && awaited.paired) return@withLock verdict ?: awaited
-        val refusal = verdict?.authError ?: awaited?.authError
+        var refusal = verdict?.authError ?: awaited?.authError
+
+        if (refusal == CONFIRM_ON_READER) {
+            note("pair: waiting for the reader's user")
+            onConfirmOnReader()
+            val deadline = System.currentTimeMillis() + PAIR_PROMPT_WAIT_MS
+            refusal = null
+            while (System.currentTimeMillis() < deadline) {
+                if (gatt == null) {
+                    lastAuthFailure = "link lost"
+                    throw BleException("The reader dropped the link while pairing", reason = Reason.LINK)
+                }
+                // A notification when one comes, a read every two seconds regardless:
+                // a trimmed notification can shed the field that matters.
+                val heard = withTimeoutOrNull(2_000) {
+                    statusUpdates.first {
+                        it.paired || (it.authError != null && it.authError != CONFIRM_ON_READER) || it.state == "error"
+                    }
+                }
+                val s = heard ?: runCatching { readStatus() }.getOrNull() ?: continue
+                if (s.paired) {
+                    verdict = runCatching { readStatus() }.getOrNull() ?: s
+                    note("pair: allowed on reader")
+                    return@withLock verdict!!
+                }
+                val err = s.authError?.takeIf { it != CONFIRM_ON_READER }
+                    ?: s.error?.takeIf { s.state == "error" && isAuthError(it) }
+                if (err != null) {
+                    refusal = err
+                    break
+                }
+            }
+            note("pair: prompt ended ${refusal ?: "timeout"}")
+        }
+
         lastAuthFailure = refusal ?: "not confirmed"
         note("pair RESULT confirmed=false")
         if (refusal != null) throw BleException(friendlyError(refusal), refusal, Reason.AUTH)
@@ -1491,6 +1543,11 @@ class BleClient(private val context: Context) {
          * whole start_put with "invalid position".
          */
         position: JSONObject? = null,
+        /**
+         * `book` only: the Calibre book UUID, `[0-9A-Za-z-]`, at most 64. Send only
+         * to a reader whose `about` lists `book_uuid`; null omits the field.
+         */
+        calibreUuid: String? = null,
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     ): UploadResult {
         val total = file.length()
@@ -1510,6 +1567,7 @@ class BleClient(private val context: Context) {
             version = version,
             signature = signature,
             position = position?.takeIf { kind == "book" },
+            calibreUuid = calibreUuid?.takeIf { kind == "book" },
         )
     }
 
@@ -1566,6 +1624,7 @@ class BleClient(private val context: Context) {
         version: String? = null,
         signature: String? = null,
         position: JSONObject? = null,
+        calibreUuid: String? = null,
     ): UploadResult = transferLock.withLock {
         if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         val dataInChar = dataIn ?: throw BleException("Not connected")
@@ -1593,6 +1652,7 @@ class BleClient(private val context: Context) {
         if (version != null) startPut.put("version", version)
         if (signature != null) startPut.put("signature", signature)
         if (position != null) startPut.put("position", position)
+        if (calibreUuid != null) startPut.put("calibre_uuid", calibreUuid)
 
         // Timing for the trace: nanoTime around the two waits, a few ns per frame.
         val t0 = System.nanoTime()
@@ -1759,12 +1819,24 @@ class BleClient(private val context: Context) {
      * Pulls a download kind (the firmware advertises `crash_report`) frame by
      * frame, acknowledging each one. Frames must arrive in sequence; a gap
      * means we lost a notification and the transfer is not trustworthy.
+     *
+     * [fields] go into `start_get` as well, e.g. `name` for a `book`. With
+     * [into] the bytes are written there as they arrive and an empty array is
+     * returned, so a whole book is never held in memory. [maxBytes] caps the
+     * size the reader announces and the bytes actually received.
+     * [onProgress] gets (received, total), total -1 while unknown.
      */
     suspend fun download(
         kind: String,
-        onProgress: (received: Long) -> Unit = {},
+        fields: Map<String, Any> = emptyMap(),
+        into: java.io.OutputStream? = null,
+        maxBytes: Long = Long.MAX_VALUE,
+        onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
     ): ByteArray = transferLock.withLock {
         if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
+        (fields["name"] as? String)?.let { name ->
+            if (!isSafeTransferName(name)) throw BleException(friendlyError("unsafe book filename"), "unsafe book filename")
+        }
         val chunks = mutableListOf<ByteArray>()
         var received = 0L
         var expected = 0L
@@ -1782,6 +1854,7 @@ class BleClient(private val context: Context) {
             .put("chunk_size", chunk)
         // Omitted, not 1, so a reader without windows sees the request it always has.
         if (window > 1) start.put("window", window)
+        for ((k, v) in fields) start.put(k, v)
 
         holdFastLink()
         try {
@@ -1818,6 +1891,7 @@ class BleClient(private val context: Context) {
                 // This download's byte count, from `sending` / `sent`. A tight
                 // notification can shed it.
                 var size: Long? = ready.size
+                if ((size ?: 0L) > maxBytes) throw BleException("The file is too large", "transfer too large")
                 var allBytesAt = 0L
                 while (true) {
                     val s = _status.value
@@ -1852,10 +1926,11 @@ class BleClient(private val context: Context) {
                     if (frame.payload.size > chunk) {
                         throw BleException("Oversized frame: ${frame.payload.size} bytes, asked for $chunk")
                     }
-                    chunks += frame.payload
                     received += frame.payload.size
+                    if (received > maxBytes) throw BleException("The file is too large", "transfer too large")
+                    if (into != null) into.write(frame.payload) else chunks += frame.payload
                     expected += 1
-                    onProgress(received)
+                    onProgress(received, size ?: -1L)
                     // get_ack is cumulative: one covers every frame up to it. Every
                     // window-th frame and always the last; with no size to tell the
                     // last one by, every frame.
@@ -1894,6 +1969,9 @@ class BleClient(private val context: Context) {
         null -> "The reader rejected the operation"
         "exists" -> "That file is already on the reader"
         "pairing window closed" -> "On the reader, open Settings"
+        CONFIRM_ON_READER -> "Confirm on the reader"
+        PAIRING_DENIED -> "Pairing was declined on the reader"
+        "not found" -> "The reader does not have that book"
         "invalid pair request" -> "The reader refused the pairing"
         "invalid trusted host auth", "unknown trusted host" ->
             "The reader does not know this phone. Pair again."
