@@ -1195,6 +1195,8 @@ class BleClient(private val context: Context) {
         val finalState: String?,
         /** True once the reader reports it saved us as a trusted host. */
         val pairedNow: Boolean,
+        /** The reader applied the `position` sent with a book, before showing it. */
+        val positionApplied: Boolean = false,
     )
 
     /**
@@ -1218,6 +1220,14 @@ class BleClient(private val context: Context) {
         version: String? = null,
         /** firmware.json `signature` (hex). Required for firmware; the reader verifies it. */
         signature: String? = null,
+        /**
+         * `book` only: a reading position the reader applies at commit, before
+         * the book appears. The same fields as a `progress` batch entry, minus
+         * `filename`. Null omits the field. Send only to a reader whose `about`
+         * document lists `book_position` in `features`; an invalid one fails the
+         * whole start_put with "invalid position".
+         */
+        position: JSONObject? = null,
         onProgress: (sent: Long, total: Long) -> Unit = { _, _ -> },
     ): UploadResult {
         val total = file.length()
@@ -1236,6 +1246,7 @@ class BleClient(private val context: Context) {
             replace = replace,
             version = version,
             signature = signature,
+            position = position?.takeIf { kind == "book" },
         )
     }
 
@@ -1291,6 +1302,7 @@ class BleClient(private val context: Context) {
         replace: Boolean = false,
         version: String? = null,
         signature: String? = null,
+        position: JSONObject? = null,
     ): UploadResult = transferLock.withLock {
         if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         val dataInChar = dataIn ?: throw BleException("Not connected")
@@ -1321,6 +1333,7 @@ class BleClient(private val context: Context) {
         if (replace) startPut.put("replace", true)
         if (version != null) startPut.put("version", version)
         if (signature != null) startPut.put("signature", signature)
+        if (position != null) startPut.put("position", position)
 
         try {
             val ready = commandAwait(startPut, 15_000) {
@@ -1371,6 +1384,7 @@ class BleClient(private val context: Context) {
                 elapsedMs = System.currentTimeMillis() - started,
                 finalState = committed.state,
                 pairedNow = committed.paired,
+                positionApplied = position != null && readPositionApplied(committed),
             )
         } catch (e: Throwable) {
             // Best effort: if the link is already gone this just fails again,
@@ -1378,6 +1392,19 @@ class BleClient(private val context: Context) {
             runCatching { writeControl(JSONObject().put("op", "cancel")) }
             throw e
         }
+    }
+
+    /**
+     * `position_applied` after a book commit that carried a `position`.
+     * Notifications shed fields to fit, so a flag missing from the committed
+     * notification is confirmed with a status READ before it counts as false.
+     */
+    private suspend fun readPositionApplied(committed: DeviceStatus): Boolean {
+        fun flag(s: DeviceStatus?): Boolean = s != null && runCatching {
+            JSONObject(s.raw).optBoolean("position_applied", false)
+        }.getOrDefault(false)
+        if (flag(committed)) return true
+        return flag(runCatching { readStatus() }.getOrNull())
     }
 
     /**

@@ -321,6 +321,124 @@ class StartFreshStore(private val context: Context) {
 }
 
 /**
+ * A resume the user chose that the reader has not confirmed yet.
+ *
+ * The position is what the reader will be sent: [percentage] always, and the
+ * spine jump ([spine], [spineFraction], [spineCount]) the reader needs to act
+ * on it. [chosenAt] is when the user answered, in epoch seconds.
+ *
+ * [appliedAt] is 0 while owed. Once the reader reports the position applied
+ * it holds the timestamp that was sent, so the next sync can recognise the
+ * reader's listing as this app's own write rather than a new reading event.
+ */
+data class OwedResume(
+    val filename: String,
+    val percentage: Float,
+    val spine: Int,
+    val spineFraction: Float,
+    val spineCount: Int,
+    val chosenAt: Long,
+    val appliedAt: Long = 0L,
+) {
+    /** A spine jump the reader will accept: 0 <= spine < spine_n <= 65535. */
+    val hasJump: Boolean get() = spineCount in 1..0xFFFF && spine in 0 until spineCount
+
+    /**
+     * The per-entry fields a `progress` batch entry and a book's `position`
+     * share. The reader needs a location or a spine jump; this app never has a
+     * location of the reader's own, so without [hasJump] this is not sendable.
+     */
+    fun positionJson(timestamp: Long): org.json.JSONObject = org.json.JSONObject().apply {
+        put("timestamp", timestamp)
+        put("pct", percentage.coerceIn(0f, 1f).toDouble())
+        if (hasJump) {
+            put("spine", spine)
+            put("spine_frac", spineFraction.coerceIn(0f, 1f).toDouble())
+            put("spine_n", spineCount)
+        }
+    }
+}
+
+/**
+ * Resumes the user chose that the reader has not applied yet.
+ *
+ * Answering "resume" does not move the reader by itself. A position batch is
+ * refused while any book is open, and the reader keeps a position only when
+ * its timestamp is newer than its own save -- so a book opened once before the
+ * position lands keeps page one forever. The choice is recorded here and
+ * delivered by the position sync until the reader confirms it. See
+ * MainViewModel.syncProgressToKosync.
+ *
+ * Keyed per reader, like [StartFreshStore], and persisted because delivery can
+ * wait for the book to be closed, a reconnect, or an app restart.
+ */
+class OwedResumeStore(private val context: Context) {
+
+    private fun key(deviceId: String?) =
+        stringPreferencesKey("owed_resume_" + (deviceId ?: "unknown"))
+
+    suspend fun load(deviceId: String?): Map<String, OwedResume> =
+        context.dataStore.data.map { decode(it[key(deviceId)]) }.first()
+
+    suspend fun put(deviceId: String?, owed: OwedResume) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            p[k] = encode(decode(p[k]) + (owed.filename to owed))
+        }
+    }
+
+    /** The reader applied it, stamped [timestamp]. */
+    suspend fun markApplied(deviceId: String?, filename: String, timestamp: Long) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            val all = decode(p[k])
+            val owed = all[filename] ?: return@edit
+            p[k] = encode(all + (filename to owed.copy(appliedAt = timestamp)))
+        }
+    }
+
+    suspend fun forget(deviceId: String?, filename: String) {
+        context.dataStore.edit { p ->
+            val k = key(deviceId)
+            val all = decode(p[k])
+            if (filename in all) p[k] = encode(all - filename)
+        }
+    }
+
+    private fun decode(raw: String?): Map<String, OwedResume> {
+        if (raw.isNullOrBlank()) return emptyMap()
+        return runCatching {
+            val obj = org.json.JSONObject(raw)
+            obj.keys().asSequence().mapNotNull { name ->
+                val o = obj.optJSONObject(name) ?: return@mapNotNull null
+                name to OwedResume(
+                    filename = name,
+                    percentage = o.optDouble("pct", 0.0).toFloat(),
+                    spine = o.optInt("spine", -1),
+                    spineFraction = o.optDouble("spine_frac", 0.0).toFloat(),
+                    spineCount = o.optInt("spine_n", 0),
+                    chosenAt = o.optLong("chosen_at", 0L),
+                    appliedAt = o.optLong("applied_at", 0L),
+                )
+            }.toMap()
+        }.getOrElse { emptyMap() }
+    }
+
+    private fun encode(all: Map<String, OwedResume>): String = org.json.JSONObject().apply {
+        for ((name, o) in all) {
+            put(name, org.json.JSONObject().apply {
+                put("pct", o.percentage.toDouble())
+                put("spine", o.spine)
+                put("spine_frac", o.spineFraction.toDouble())
+                put("spine_n", o.spineCount)
+                put("chosen_at", o.chosenAt)
+                put("applied_at", o.appliedAt)
+            })
+        }
+    }.toString()
+}
+
+/**
  * Books the user has removed that the reader has not let go of yet.
  *
  * Removing a book while the reader is out of range keeps the local copy until

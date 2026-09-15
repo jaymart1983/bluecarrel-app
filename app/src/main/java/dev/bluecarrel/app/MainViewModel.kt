@@ -309,6 +309,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val sentBooks = SentBooksStore(app)
     private val pendingRemovals = PendingRemovalStore(app)
     private val startFresh = StartFreshStore(app)
+    private val owedResumes = OwedResumeStore(app)
     private val replaceOnSend = ReplaceOnSendStore(app)
 
     /** Completed by [answerResume]; awaited by the save that raised the prompt. */
@@ -524,11 +525,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // Closing a book saves its position, and the reader notifies on
                 // that, so the next status after the book is closed retries the send.
                 // Throttled: while the book stays open, every page turn notifies.
-                if (bookOpenDeferredAt != 0L && _state.value.connected && _state.value.authorized) {
+                //
+                // An owed resume refused the same way retries the same way, but at
+                // once on the status that shows the book closing: the user may
+                // reopen it within seconds and the position has to be there first.
+                // Firmware that never reports `open` keeps the throttle only.
+                val closedNow = lastStatusBookOpen && !s.bookOpen
+                lastStatusBookOpen = s.bookOpen
+                if ((bookOpenDeferredAt != 0L || owedResumeBlocked) &&
+                    _state.value.connected && _state.value.authorized
+                ) {
                     val now = System.currentTimeMillis()
-                    if (now - lastBookOpenRetryAt >= BOOK_OPEN_RETRY_MS) {
+                    if ((owedResumeBlocked && closedNow) || now - lastBookOpenRetryAt >= BOOK_OPEN_RETRY_MS) {
                         lastBookOpenRetryAt = now
-                        mirrorToDevice()
+                        // A positions pass runs the mirror too, so it covers both.
+                        if (owedResumeBlocked) requestSync(positions = true) else mirrorToDevice()
                     }
                 }
             }
@@ -913,6 +924,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** A session whose reader_proof verified: mark it and start what a connection does. */
     private fun onAuthorized(silent: Boolean) {
         linkFailStreak = 0
+        // A new session may be a different reader or new firmware.
+        aboutFeatures = null
         _state.value = _state.value.copy(
             authorized = true,
             pairing = PairingState.TRUSTED,
@@ -1165,6 +1178,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Read once for the whole pass rather than per book: it is a DataStore
         // round trip and the answer cannot change mid-walk.
         val freshStarts = startFresh.load(deviceKey())
+        // Resumes the user chose that the reader has not confirmed. See OwedResumeStore.
+        val readerKey = deviceKey()
+        val owed = owedResumes.load(readerKey)
+        val nowSeconds = System.currentTimeMillis() / 1000
+        // filename -> the timestamp its owed resume went out with in this batch.
+        val owedSent = mutableMapOf<String, Long>()
 
         // Every book's kosync lookups, fetched TOGETHER before the walk. They ran
         // one after another -- two round trips per book through Cloudflare, about
@@ -1194,6 +1213,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 transfer = TransferProgress("Syncing with reader…", index.toLong(), entries.size.toLong())
             )
             val filename = entry.optString("filename").ifBlank { null } ?: continue
+
+            // OWED RESUME, ahead of everything that needs a saved position: a book
+            // sent and never opened has no `location` or `timestamp` at all, and it
+            // is exactly the book a resume is owed to.
+            //
+            // Sent only while the reader is below OWED_RESUME_UNREAD (2%). Below
+            // that the book has at most been opened, and the user's explicit answer
+            // outranks it. At or above it the user has read on the reader since, so
+            // the choice is dropped and the ordinary rules below apply.
+            //
+            // Stamped past the reader's own save, because the reader keeps a
+            // position only when its timestamp is strictly newer. The server row's
+            // set_at is days old and loses to a save made by merely opening the
+            // book -- which is how "resume at 89.5%" stayed at 0.1%.
+            val owedHere = owed[filename]
+            if (owedHere != null) {
+                val readerPct = entry.optDouble("percent", 0.0).toFloat()
+                val readerSavedAt = entry.optLong("timestamp", 0L)
+                if (owedHere.appliedAt > 0L) {
+                    // Delivered. While the reader's save is still the one this app
+                    // wrote, it is the server's own position coming back: never
+                    // publish it as a new reading event. Any other save is the
+                    // user's, and from then on the ordinary rules apply.
+                    if (readerSavedAt == owedHere.appliedAt) continue
+                    owedResumes.forget(readerKey, filename)
+                } else if (readerPct < OWED_RESUME_UNREAD) {
+                    val stamp = maxOf(nowSeconds, readerSavedAt + 1)
+                    toDevice += owedHere.positionJson(stamp).put("filename", filename)
+                    owedSent[filename] = stamp
+                    continue
+                } else {
+                    owedResumes.forget(readerKey, filename)
+                }
+            }
+
             val location = entry.optString("location").ifBlank { null } ?: continue
             // Omitted rather than zeroed by the device when unknown -- see
             // BookLibraryIndex::writeEntry. Absent means the clock was unset.
@@ -1350,24 +1404,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Without it a position written to CWA by anything else would show on
         // the library row and never reach the reader.
         var pushed = 0
+        var owedNotice: String? = null
         if (toDevice.isNotEmpty()) {
             _state.value = _state.value.copy(
                 transfer = TransferProgress("Syncing with reader…", 0, toDevice.size.toLong())
             )
             val batch = JSONArray().apply { toDevice.forEach { put(it) } }.toString()
-            val ok = runCatching {
+            val upload = runCatching {
                 ble.uploadBytes(batch.toByteArray(Charsets.UTF_8), kind = "progress")
-            }.isSuccess
-            if (ok) pushed = toDevice.size
+            }
+            if (upload.isSuccess) pushed = toDevice.size
             invalidateReaderListing()
+            if (owedSent.isNotEmpty()) {
+                owedNotice = settleOwedResumes(readerKey, owedSent, owed, upload.exceptionOrNull(), cachedShelf)
+            }
+        }
+        if (owedSent.isEmpty()) {
+            // Nothing owed was eligible: none left, or each one was dropped above.
+            owedResumeDue = false
+            owedResumeBlocked = false
         }
         lastPositionSyncAt = System.currentTimeMillis()
 
         _state.value = _state.value.copy(
             syncingProgress = false,
             transfer = null,
-            // Quiet inside a sync: one sync, one bar, no trailing report.
-            message = if (syncJob?.isActive == true) _state.value.message else buildString {
+            // Quiet inside a sync: one sync, one bar, no trailing report. The one
+            // exception is a resume waiting on the user to close the book.
+            message = owedNotice ?: if (syncJob?.isActive == true) _state.value.message else buildString {
                 append("Synced $written position")
                 if (written != 1) append("s")
                 if (skippedOlder > 0) append(", $skippedOlder already current")
@@ -1694,6 +1758,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         var sentAny = false
         for (row in pending) {
             if (!_state.value.connected || !_state.value.authorized) break
+            // Checked here, not when the list was built: the question can be
+            // raised after this pass read the shelf. cacheBook sends it once answered.
+            if (row.book.filename in resumeUndecided) continue
             sendToDevice(row).join()
             sentAny = true
         }
@@ -1787,7 +1854,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Positions when the pass was a full one or something was just sent, not
         // on every small trigger: a page-turn-driven pass has nothing to add.
         val recent = System.currentTimeMillis() - lastPositionSyncAt < LISTING_TTL_MS
-        if (sentAny || ((catalogue || positions) && !recent)) {
+        // An owed resume skips the throttle: this pass is what it is waiting for.
+        if (sentAny || (positions && owedResumeDue) || ((catalogue || positions) && !recent)) {
             if (!_state.value.syncingProgress) syncProgressToKosync().join()
         }
     }
@@ -1802,10 +1870,130 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun answerResume(resume: Boolean) = viewModelScope.launch {
         val prompt = _state.value.resumePrompt ?: return@launch
         _state.value = _state.value.copy(resumePrompt = null)
-        if (resume) startFresh.forget(deviceKey(), prompt.filename)
-        else startFresh.add(deviceKey(), prompt.filename)
+        if (resume) {
+            startFresh.forget(deviceKey(), prompt.filename)
+        } else {
+            startFresh.add(deviceKey(), prompt.filename)
+            owedResumes.forget(deviceKey(), prompt.filename)
+        }
+        // A resume is recorded by cacheBook, which holds the server position.
         resumeAnswer?.complete(resume)
         resumeAnswer = null
+    }
+
+    /**
+     * Records "resume" as owed to the reader. See [OwedResumeStore].
+     *
+     * The reader needs a spine jump to act on a position from here, and rows
+     * this app writes carry only a percentage, so the jump is worked out from
+     * the EPUB on this phone ([EpubSpine]). A spine the server row carries is
+     * preferred when it was measured on a file with the same spine count.
+     * With neither, nothing is owed: the reader could not apply it.
+     */
+    private suspend fun recordOwedResume(book: Book, saved: Progress) {
+        val payload = saved.payloadJson()
+        val rowSpineN = payload?.optInt("spine_n", 0) ?: 0
+        val rowSpine = payload?.optInt("spine", -1) ?: -1
+        val fromRow = if (rowSpineN > 0 && rowSpine in 0 until rowSpineN) {
+            SpineJump(rowSpine, (payload?.optDouble("spine_frac", 0.0) ?: 0.0).toFloat(), rowSpineN)
+        } else null
+        val derived = withContext(Dispatchers.IO) { EpubSpine.jumpFor(books.fileFor(book), saved.percentage) }
+        val jump = when {
+            fromRow != null && (derived == null || derived.count == fromRow.count) -> fromRow
+            else -> derived
+        }
+        if (jump == null) {
+            owedResumes.forget(deviceKey(), book.filename)
+            return
+        }
+        owedResumes.put(
+            deviceKey(),
+            OwedResume(
+                filename = book.filename,
+                percentage = saved.percentage,
+                spine = jump.spine,
+                spineFraction = jump.fraction,
+                spineCount = jump.count,
+                chosenAt = System.currentTimeMillis() / 1000,
+            ),
+        )
+        owedResumeDue = true
+    }
+
+    /**
+     * Settles the owed resumes a position batch carried. One is cleared only
+     * when the reader reports it `applied`. Returns the one line worth showing.
+     */
+    private suspend fun settleOwedResumes(
+        readerKey: String?,
+        sent: Map<String, Long>,
+        owed: Map<String, OwedResume>,
+        failure: Throwable?,
+        shelf: Map<String, Book>,
+    ): String? {
+        if ((failure as? BleClient.BleException)?.code == "book open") {
+            // Still owed; the status stream retries when the book closes. Said once.
+            val first = !owedResumeBlocked
+            owedResumeBlocked = true
+            owedResumeDue = true
+            if (!first) return null
+            val name = sent.keys.first()
+            val title = shelf[name]?.title ?: name
+            val pct = Progress(
+                document = name,
+                percentage = owed[name]?.percentage ?: return null,
+                device = "",
+                timestamp = 0L,
+            ).percentLabel
+            return "Close \"$title\" on the reader to move it to $pct"
+        }
+        owedResumeBlocked = false
+        owedResumeDue = false
+        // Any other failure: still owed, and the next positions pass tries again.
+        if (failure != null) return null
+        val results = progressResults() ?: return null
+        for ((name, stamp) in sent) {
+            when (results[name]) {
+                "applied" -> owedResumes.markApplied(readerKey, name, stamp)
+                // Nothing the reader could ever act on: stop sending it.
+                "invalid", "not_found", "unsupported" -> owedResumes.forget(readerKey, name)
+                // skipped_older, write_failed, or no answer: stays owed.
+                else -> Unit
+            }
+        }
+        return null
+    }
+
+    /** filename -> outcome of the last `progress` batch, or null when the reader cannot say. */
+    private suspend fun progressResults(): Map<String, String>? = runCatching {
+        val arr = JSONArray(String(ble.download("progress_result"), Charsets.UTF_8))
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val name = o.optString("filename").ifBlank { null } ?: return@mapNotNull null
+            name to o.optString("result")
+        }.toMap()
+    }.getOrNull()
+
+    /**
+     * Whether this reader applies a `position` sent with a book: `book_position`
+     * in the `about` document's `features`, read once per connection.
+     */
+    private suspend fun readerTakesBookPosition(): Boolean {
+        aboutFeatures?.let { return BOOK_POSITION in it }
+        val doc = runCatching { JSONObject(String(ble.download("about"), Charsets.UTF_8)) }
+        doc.getOrNull()?.let { rememberAboutFeatures(it) }
+        // Firmware without the `about` kind has no features either. Any other
+        // failure (a dropped link) is not an answer, so it is not cached.
+        if ((doc.exceptionOrNull() as? BleClient.BleException)?.code == "unsupported transfer kind") {
+            aboutFeatures = emptySet()
+        }
+        return aboutFeatures?.contains(BOOK_POSITION) == true
+    }
+
+    private fun rememberAboutFeatures(about: JSONObject) {
+        val arr = about.optJSONArray("features")
+        aboutFeatures = if (arr == null) emptySet()
+        else (0 until arr.length()).mapNotNull { arr.optString(it).ifBlank { null } }.toSet()
     }
 
     /**
@@ -2193,6 +2381,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var bookOpenDeferredAt = 0L
     private var lastBookOpenRetryAt = 0L
 
+    /** An owed resume is waiting to be tried; lets a positions pass past the listing throttle. */
+    private var owedResumeDue = false
+    /** The last owed-resume batch was refused with "book open"; the status stream retries it. */
+    private var owedResumeBlocked = false
+    /** What the previous status said about an open book, so the close itself can be seen. */
+    private var lastStatusBookOpen = false
+    /**
+     * `features` from this connection's `about` document; null until read.
+     * Statuses read after hello are trimmed and do not carry capabilities.
+     */
+    private var aboutFeatures: Set<String>? = null
+    /**
+     * Saves whose resume question is still unanswered. The mirror holds these
+     * back: where the book opens is the user's answer, and it travels with the send.
+     */
+    private val resumeUndecided = mutableSetOf<String>()
+
+    /** Below this the reader has at most opened the book, and an owed resume still wins. */
+    private val OWED_RESUME_UNREAD = 0.02f
+    private val BOOK_POSITION = "book_position"
+
     private fun invalidateReaderListing() {
         readerListing = null
     }
@@ -2391,6 +2600,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun cacheBook(row: BookRow) = viewModelScope.launch {
         val c = _state.value.config
+        // Held out of any mirror until the resume question is settled, because
+        // books.remember below puts it on the shelf before the question is asked.
+        resumeUndecided += row.book.filename
         markBusy(row.book.id, true)
         _state.value = _state.value.copy(message = null)
         // The transfer bar covers the DOWNLOAD too, not just the BLE push. The
@@ -2457,11 +2669,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         percentLabel = saved.percentLabel,
                     ),
                 )
-                answer.await()
+                // Recorded BEFORE the mirror below sends the book, so the send can
+                // carry the position (sendToDevice) and the first open lands on it.
+                if (answer.await()) recordOwedResume(row.book, saved)
             } else {
                 // No question asked means no standing instruction to restart.
                 startFresh.forget(deviceKey(), row.book.filename)
+                owedResumes.forget(deviceKey(), row.book.filename)
             }
+            resumeUndecided -= row.book.filename
 
             // Straight into the mirror. It reads the shelf itself as its first
             // step, so loading it here as well ran the whole pass twice before
@@ -2476,9 +2692,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // null over the real value. Every freshly saved book then showed no
             // reading position at all.
             mirrorToDevice().join()
+            // The position as soon as the book is there, before the user is likely
+            // to open it. Usually the send or that pass already delivered it.
+            if (owedResumeDue) requestSync(positions = true)
             // Progress afterwards, off the critical path: it is decoration on a
             // list the user can already see and act on.
             loadLibrary()
+        } else {
+            resumeUndecided -= row.book.filename
         }
     }
 
@@ -2630,6 +2851,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // is still on its way, which is most of the wait.
         sendBookMetadata(row.book)
 
+        // Timestamp of a position sent with the book; 0 when none was.
+        var positionStamp = 0L
         val outcome = runCatching {
             // The local copy doubles as the offline library and as the source
             // for handing the book to KOReader, so it is kept, not deleted.
@@ -2648,13 +2871,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
             var lastShown = 0L
             val replacing = row.book.filename in replaceOnSend.load(deviceKey())
-            ble.upload(target, row.book.filename, replace = replacing) { sent, total ->
+            // An owed resume rides with the book where the reader can take it, so
+            // the very first open lands on it. Not on a replace: the reader may
+            // hold real reading there, and the position sync's 2% rule decides.
+            // Otherwise the position sync after the send delivers it.
+            // Owed first: `about` is read only when there is a position to send.
+            val owedHere = if (replacing) null else {
+                owedResumes.load(deviceKey())[row.book.filename]
+                    ?.takeIf { it.appliedAt == 0L && it.hasJump }
+                    ?.takeIf { readerTakesBookPosition() }
+            }
+            val onProgress: (Long, Long) -> Unit = { sent, total ->
                 if (sent - lastShown >= PROGRESS_STEP_BYTES || sent == total) {
                     lastShown = sent
                     _state.value = _state.value.copy(
                         transfer = TransferProgress("Transferring: ${row.book.title}", sent, total)
                     )
                 }
+            }
+            positionStamp = if (owedHere != null) System.currentTimeMillis() / 1000 else 0L
+            try {
+                ble.upload(
+                    target,
+                    row.book.filename,
+                    replace = replacing,
+                    position = owedHere?.positionJson(positionStamp),
+                    onProgress = onProgress,
+                )
+            } catch (e: BleClient.BleException) {
+                // The reader refuses the whole send over a position it cannot take.
+                // The book matters more: send it bare, and the position sync delivers.
+                if (positionStamp == 0L || e.code != "invalid position") throw e
+                positionStamp = 0L
+                lastShown = 0L
+                ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
             }
         }
 
@@ -2665,6 +2915,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 replaceOnSend.forget(deviceId, row.book.filename)
                 invalidateReaderListing()
                 bookOpenDeferredAt = 0L
+                // Applied with the book: no longer owed. Otherwise the position
+                // sync that follows the send delivers it.
+                if (positionStamp > 0L && r.positionApplied) {
+                    owedResumes.markApplied(deviceId, row.book.filename, positionStamp)
+                }
                 // On the reader now: the row goes back to full colour.
                 markPendingTransfer(row.book.id, false)
                 val secs = (r.elapsedMs / 1000.0).coerceAtLeast(0.1)
@@ -2822,6 +3077,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val about = if (linked && readReader) {
             runCatching { org.json.JSONObject(String(ble.download("about"), Charsets.UTF_8)) }
         } else null
+        about?.getOrNull()?.let { rememberAboutFeatures(it) }
         // Firmware from before the `about` download refuses the kind outright, and
         // that is itself an answer: the version report shipped with the update
         // page, so a reader that cannot give one is older than anything on it. Any
