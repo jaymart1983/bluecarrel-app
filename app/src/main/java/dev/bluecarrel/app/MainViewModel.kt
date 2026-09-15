@@ -519,6 +519,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         override fun onLowMemory() = Unit
     }
 
+    // Declared before init: init starts collectors that run at once (the connection
+    // flow emits IDLE and clears reader transfers), and a property declared below
+    // init is still null when they do.
+    /**
+     * Transfers in flight, by owner, in the order they started. [UiState.transfer]
+     * is one of them. Main thread only.
+     *
+     * One slot written by everyone was what made the bar jump: a firmware
+     * download beside a sync had its bar replaced by each book's progress and
+     * then CLEARED when the book ended (or when a Store request went idle), so
+     * the bar fell back to the sync line until the next download step put it
+     * back.
+     */
+    private val transfers = LinkedHashMap<String, TransferProgress>()
+    private val calibreGate = ProgressGate()
+
     init {
         app.registerComponentCallbacks(configWatcher)
         // PHY and priority reports arrive on Bluetooth threads.
@@ -1161,17 +1177,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- transfer bar ------------------------------------------------------------
 
-    /**
-     * Transfers in flight, by owner, in the order they started. [UiState.transfer]
-     * is one of them. Main thread only.
-     *
-     * One slot written by everyone was what made the bar jump: a firmware
-     * download beside a sync had its bar replaced by each book's progress and
-     * then CLEARED when the book ended (or when a Store request went idle), so
-     * the bar fell back to the sync line until the next download step put it
-     * back.
-     */
-    private val transfers = LinkedHashMap<String, TransferProgress>()
 
     /**
      * The one to show: a firmware image once it has a size holds the bar for its
@@ -2905,7 +2910,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val CALIBRE_LABEL = "Updating from Calibre…"
 
-    private val calibreGate = ProgressGate()
 
     /** The bar shows a Calibre download only when no other transfer is using it; see [shownTransfer]. */
     private fun showCalibreProgress(sent: Long, total: Long) {
