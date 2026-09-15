@@ -848,11 +848,14 @@ private fun TransferBar(t: TransferProgress) {
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(12.dp))
-                // Percent, not KB: the question being asked is "how far along",
-                // and a percentage answers it without needing to be read against
-                // a second number.
+                // Percent first: the question being asked is "how far along". A
+                // firmware send adds its rate, which says whether minutes remain.
                 Text(
-                    if (t.total > 0) "${(t.fraction * 100).roundToInt()}%" else "…",
+                    when {
+                        t.total <= 0 -> "…"
+                        t.kbps > 0 -> "${(t.fraction * 100).roundToInt()}% · ${t.kbps} KB/s"
+                        else -> "${(t.fraction * 100).roundToInt()}%"
+                    },
                     style = MaterialTheme.typography.labelMedium,
                     maxLines = 1,
                 )
@@ -1647,6 +1650,11 @@ private fun SettingsSheet(
                             append("reader auth_error=").append(state.lastAuthError ?: "-").append('\n')
                             append("last auth attempt:\n").append(state.authTrace)
                             append("\nstore:\n").append(state.storeTrace)
+                            append("\n\nlink: ").append(state.linkInfo.ifBlank { "-" })
+                            append("\n\nlast sync:\n")
+                            append(state.syncTrace.joinToString("\n").ifBlank { "none yet" })
+                            append("\n\nsync before:\n")
+                            append(state.previousSyncTrace.joinToString("\n").ifBlank { "none" })
                         },
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,

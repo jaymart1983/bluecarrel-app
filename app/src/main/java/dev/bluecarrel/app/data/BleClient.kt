@@ -22,7 +22,12 @@ import android.os.Build
 import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.coroutineScope
@@ -53,6 +58,7 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
@@ -127,6 +133,22 @@ class BleClient(private val context: Context) {
 
         /** The user reads the passkey off the reader and types it. */
         private const val BOND_TIMEOUT_MS = 60_000L
+
+        /** Longest a hello waits for the reader's answer. */
+        private const val HELLO_TIMEOUT_MS = 5_000L
+        /** First status read after a hello, then every [HELLO_READ_EVERY_MS]. */
+        private const val HELLO_FIRST_READ_MS = 150L
+        private const val HELLO_READ_EVERY_MS = 250L
+
+        /** A download with no frame and no status for this long has stalled. */
+        private const val DOWNLOAD_STALL_MS = 20_000L
+        /** After the last byte, how long to wait for the reader's `sent`. */
+        private const val SENT_GRACE_MS = 1_500L
+
+        /** Balanced priority is restored this long after the last transfer or sync ends. */
+        private const val FAST_LINK_LINGER_MS = 2_000L
+        /** The PHY is read back this long after asking for 2M. */
+        private const val PHY_READ_DELAY_MS = 1_500L
 
         /** The reader must speak security v2. */
         const val PROTOCOL_VERSION = 2
@@ -304,6 +326,28 @@ class BleClient(private val context: Context) {
      */
     private val authLock = Mutex()
 
+    /** Link events for the sync trace: PHY reports and priority requests. Called on any thread. */
+    @Volatile
+    var onLinkEvent: ((String) -> Unit)? = null
+
+    /** The PHY the stack last reported, e.g. "tx=2M rx=2M"; null until known. */
+    @Volatile
+    var phy: String? = null
+        private set
+
+    /** The ATT MTU negotiated for this link. */
+    val negotiatedMtu: Int get() = mtu
+
+    /** CONNECTION_PRIORITY_HIGH is in force. */
+    val fastLink: Boolean get() = priorityHigh
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** Syncs and transfers holding the link at high priority; see [holdFastLink]. */
+    private val fastHolds = AtomicInteger(0)
+    @Volatile private var relaxJob: Job? = null
+    @Volatile private var priorityHigh = false
+
     private var connectGate: CompletableDeferred<Unit>? = null
     private var servicesGate: CompletableDeferred<Unit>? = null
     private var mtuGate: CompletableDeferred<Int>? = null
@@ -427,6 +471,12 @@ class BleClient(private val context: Context) {
             mtuGate?.complete(if (statusCode == BluetoothGatt.GATT_SUCCESS) negotiated else DEFAULT_MTU)
         }
 
+        override fun onPhyUpdate(g: BluetoothGatt, txPhy: Int, rxPhy: Int, statusCode: Int) =
+            notePhy("update", txPhy, rxPhy, statusCode)
+
+        override fun onPhyRead(g: BluetoothGatt, txPhy: Int, rxPhy: Int, statusCode: Int) =
+            notePhy("read", txPhy, rxPhy, statusCode)
+
         override fun onCharacteristicWrite(
             g: BluetoothGatt,
             c: BluetoothGattCharacteristic,
@@ -537,7 +587,42 @@ class BleClient(private val context: Context) {
         authorized = false
         authedDeviceId = null
         mtu = DEFAULT_MTU
+        priorityHigh = false
+        phy = null
         _connection.value = BleConnection.IDLE
+    }
+
+    private fun phyName(p: Int): String = when (p) {
+        BluetoothDevice.PHY_LE_1M -> "1M"
+        BluetoothDevice.PHY_LE_2M -> "2M"
+        BluetoothDevice.PHY_LE_CODED -> "coded"
+        else -> "?$p"
+    }
+
+    private fun notePhy(how: String, tx: Int, rx: Int, statusCode: Int) {
+        val text = if (statusCode == BluetoothGatt.GATT_SUCCESS) "tx=${phyName(tx)} rx=${phyName(rx)}"
+        else "failed (GATT status $statusCode)"
+        if (statusCode == BluetoothGatt.GATT_SUCCESS) phy = text
+        onLinkEvent?.invoke("phy $how $text")
+    }
+
+    /**
+     * Asks for LE 2M both ways, and reads back what was agreed. The reader offers
+     * 1M|2M; without the phone asking too, some stacks stay on 1M.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestPreferredPhy(g: BluetoothGatt) {
+        runCatching {
+            g.setPreferredPhy(
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+            )
+        }.onFailure { onLinkEvent?.invoke("phy request refused: ${it.message}") }
+        scope.launch {
+            delay(PHY_READ_DELAY_MS)
+            if (gatt === g) runCatching { g.readPhy() }
+        }
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -630,6 +715,10 @@ class BleClient(private val context: Context) {
 
             enableNotifications(statusChar!!)
             enableNotifications(dataOut!!)
+
+            requestPreferredPhy(g)
+            // A sync that was holding the link fast before a reconnect still is.
+            if (fastHolds.get() > 0) setPriority(high = true)
 
             val initial = readStatus()
             if ((initial.protocolVersion ?: 0) < PROTOCOL_VERSION) {
@@ -919,10 +1008,49 @@ class BleClient(private val context: Context) {
         }
     }
 
-    /** Asks for Android's shortest connection interval. Best effort: a refusal only costs speed. */
+    /**
+     * Holds the link at CONNECTION_PRIORITY_HIGH until the matching
+     * [releaseFastLink]. Android keeps a link at its balanced 30-50 ms interval
+     * unless the app asks, and every frame and every acknowledgement waits on
+     * that interval. Held for a whole sync, not per request, so the interval is
+     * not renegotiated between steps; balanced again [FAST_LINK_LINGER_MS] after
+     * the last hold ends.
+     */
+    fun holdFastLink() {
+        if (fastHolds.incrementAndGet() == 1) {
+            relaxJob?.cancel()
+            relaxJob = null
+            setPriority(high = true)
+        }
+    }
+
+    fun releaseFastLink() {
+        val left = fastHolds.decrementAndGet()
+        if (left < 0) {
+            fastHolds.set(0)
+            return
+        }
+        if (left == 0) {
+            relaxJob?.cancel()
+            relaxJob = scope.launch {
+                delay(FAST_LINK_LINGER_MS)
+                if (fastHolds.get() == 0) setPriority(high = false)
+            }
+        }
+    }
+
+    /** Best effort: a refusal only costs speed. */
     @SuppressLint("MissingPermission")
-    private fun requestFastLink() {
-        runCatching { gatt?.requestConnectionPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH) }
+    private fun setPriority(high: Boolean) {
+        val g = gatt ?: return
+        if (priorityHigh == high) return
+        val ok = runCatching {
+            g.requestConnectionPriority(
+                if (high) BluetoothGatt.CONNECTION_PRIORITY_HIGH else BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+            )
+        }.getOrDefault(false)
+        if (ok) priorityHigh = high
+        onLinkEvent?.invoke("priority " + (if (high) "high" else "balanced") + (if (ok) "" else " refused"))
     }
 
     private suspend fun writeControl(command: JSONObject) {
@@ -1135,18 +1263,65 @@ class BleClient(private val context: Context) {
             .put("host_name", identity.hostName)
             .put("client_nonce", c)
             .put("response", response)
-        // Ring the doorbell, then read: a notification is capped at ATT_MTU-3 and
-        // can shed fields, so the proof is taken from whichever one carries it.
-        val awaited = runCatching {
-            commandAwait(command, 5_000) { it.readerProof != null || it.authError != null || it.state == "error" }
+        // Ring the doorbell, then READ. The reader's status notification is capped
+        // at 180 bytes and an accepted hello's sheds reader_proof, so waiting for
+        // the notification alone sat out the whole timeout on every connect. A
+        // refusal (auth_error) does fit a notification; the proof is read.
+        //
+        // Only a NEW auth_error or error counts from the stream: a read taken
+        // before the reader has handled the hello still carries the last one.
+        var awaited: DeviceStatus? = null
+        var proven: DeviceStatus? = null
+        var awaitFailure: Throwable? = null
+        val helloStarted = System.currentTimeMillis()
+        try {
+            withTimeoutOrNull(HELLO_TIMEOUT_MS) {
+                coroutineScope {
+                    val answer = CompletableDeferred<DeviceStatus>()
+                    val subscribed = CompletableDeferred<Unit>()
+                    val watch = launch {
+                        val first = statusUpdates
+                            .onSubscription { subscribed.complete(Unit) }
+                            .first {
+                                (it.authError != null && it.authError != pre.authError) ||
+                                    (it.state == "error" && pre.state != "error") ||
+                                    (it.readerProof != null && proofMatches(expected, it.readerProof))
+                            }
+                        answer.complete(first)
+                    }
+                    subscribed.await()
+                    writeControl(command)
+                    var wait = HELLO_FIRST_READ_MS
+                    while (true) {
+                        val heard = withTimeoutOrNull(wait) { answer.await() }
+                        if (heard != null) {
+                            awaited = heard
+                            break
+                        }
+                        val read = runCatching { readStatus() }.getOrNull()
+                        if (read?.readerProof != null && proofMatches(expected, read.readerProof)) {
+                            proven = read
+                            break
+                        }
+                        wait = HELLO_READ_EVERY_MS
+                    }
+                    watch.cancel()
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            awaitFailure = e
         }
-        note("hello await=" + awaited.fold(
-            { "proof=${it.readerProof != null} auth_error=${it.authError ?: "-"}" },
-            { "timeout/err: ${it.message}" },
-        ))
-        val verdict = runCatching { readStatus() }.getOrNull()
+        note("hello " + (System.currentTimeMillis() - helloStarted) + " ms: " + when {
+            proven != null -> "proof read"
+            awaited != null -> "proof=${awaited?.readerProof != null} auth_error=${awaited?.authError ?: "-"}"
+            awaitFailure != null -> "err: ${awaitFailure?.message}"
+            else -> "timeout"
+        })
+        val verdict = proven ?: runCatching { readStatus() }.getOrNull()
         note("verdict proof=${verdict?.readerProof != null} auth_error=${verdict?.authError ?: verdict?.error ?: "-"}")
-        val proofOk = listOfNotNull(awaited.getOrNull()?.readerProof, verdict?.readerProof)
+        val proofOk = listOfNotNull(awaited?.readerProof, verdict?.readerProof)
             .any { proofMatches(expected, it) }
         val verdictId = verdict?.deviceId
         val sameReader = verdictId == null || verdictId == i
@@ -1156,10 +1331,10 @@ class BleClient(private val context: Context) {
         lastAuthFailure = when {
             ok -> null
             // The reader's own word wins: "unknown trusted host" means it forgot us.
-            else -> awaited.getOrNull()?.authError ?: verdict?.authError
+            else -> awaited?.authError ?: verdict?.authError
                 ?: verdict?.error?.takeIf { verdict?.state == "error" && isAuthError(it) }
                 ?: if (!sameReader) "different reader"
-                else if (awaited.isFailure && verdict?.readerProof == null) "no reply"
+                else if (awaited == null && verdict?.readerProof == null) "no reply"
                 else "bad reader proof"
         }
         note("RESULT authorized=$ok (proof=$proofOk sameReader=$sameReader)")
@@ -1310,10 +1485,6 @@ class BleClient(private val context: Context) {
             throw BleException("\"$name\" is not a name the reader will accept")
         }
 
-        // Android keeps a link at its balanced 30-50 ms interval unless the app asks,
-        // whatever the reader requested; every frame waits on that interval.
-        requestFastLink()
-
         // mtu - 3 is the ATT payload; the frame header eats 4 more.
         val chunk = minOf(MAX_CHUNK_BYTES, maxOf(1, mtu - 3 - FRAME_HEADER_BYTES))
         val started = System.currentTimeMillis()
@@ -1335,6 +1506,7 @@ class BleClient(private val context: Context) {
         if (signature != null) startPut.put("signature", signature)
         if (position != null) startPut.put("position", position)
 
+        holdFastLink()
         try {
             val ready = commandAwait(startPut, 15_000) {
                 it.state == "receiving" || it.state == "error"
@@ -1391,6 +1563,8 @@ class BleClient(private val context: Context) {
             // and the reader drops its own partial ".ble-" staging file.
             runCatching { writeControl(JSONObject().put("op", "cancel")) }
             throw e
+        } finally {
+            releaseFastLink()
         }
     }
 
@@ -1465,38 +1639,65 @@ class BleClient(private val context: Context) {
             .put("kind", kind)
             .put("chunk_size", DOWNLOAD_CHUNK_BYTES)
 
+        holdFastLink()
+        try {
         coroutineScope {
-            // Buffer frames from the moment before start_get is written.
-            // Subscribing lazily inside the loop would drop any frame that
-            // lands between two iterations.
-            val queue = Channel<DataFrame>(Channel.UNLIMITED)
-            val subscribed = CompletableDeferred<Unit>()
-            val pump = launch {
+            // Frames AND statuses, in one queue, from the moment before start_get
+            // is written. The reader sets `sent` only after it has the ack for the
+            // last frame, so the loop must wake on that status too: waiting on
+            // frames alone sat out the whole stall timeout after every download.
+            val queue = Channel<Any>(Channel.UNLIMITED)
+            val framesSubscribed = CompletableDeferred<Unit>()
+            val statusSubscribed = CompletableDeferred<Unit>()
+            val framePump = launch {
                 dataOutFrames
-                    .onSubscription { subscribed.complete(Unit) }
+                    .onSubscription { framesSubscribed.complete(Unit) }
                     .collect { queue.trySend(it) }
             }
-            subscribed.await()
+            val statusPump = launch {
+                statusUpdates
+                    .onSubscription { statusSubscribed.complete(Unit) }
+                    .collect { queue.trySend(it) }
+            }
+            framesSubscribed.await()
+            statusSubscribed.await()
 
             try {
+                // Not "sent": a late `sent` from the previous download can land after
+                // this start_get is written. This download always publishes
+                // `sending` first.
                 val ready = commandAwait(start, 15_000) {
-                    it.state == "sending" || it.state == "sent" || it.state == "error"
+                    it.state == "sending" || it.state == "error"
                 }
                 failIfError(ready)
 
-                // Frames can still be in flight after "sent" arrives, so drain
-                // until the byte counts agree rather than trusting the state.
-                var draining = true
-                while (draining) {
-                    val done = _status.value
-                    if (done?.state == "error") failIfError(done)
-                    if (done?.state == "sent" && done.size != null && received >= done.size) break
+                // This download's byte count, from `sending` / `sent`. A tight
+                // notification can shed it.
+                var size: Long? = ready.size
+                var allBytesAt = 0L
+                while (true) {
+                    val s = _status.value
+                    if (s != null) {
+                        if (s.state == "error") failIfError(s)
+                        if ((s.state == "sending" || s.state == "sent") && s.size != null) size = s.size
+                        // `sent` follows the ack of the last frame, and a frame is acked
+                        // only once it is in hand: nothing is left to arrive.
+                        if (s.state == "sent") break
+                    }
+                    val total = size
+                    val complete = total != null && received >= total
+                    val now = System.currentTimeMillis()
+                    if (complete && allBytesAt == 0L) allBytesAt = now
+                    val waitMs = if (complete) SENT_GRACE_MS - (now - allBytesAt) else DOWNLOAD_STALL_MS
+                    if (waitMs <= 0L) break
 
-                    val frame = withTimeoutOrNull(20_000) { queue.receive() }
-                    if (frame == null) {
-                        if (_status.value?.state == "sent") { draining = false; continue }
+                    val event = withTimeoutOrNull(waitMs) { queue.receive() }
+                    if (event == null) {
+                        // Every byte arrived and `sent` did not follow: done anyway.
+                        if (complete || _status.value?.state == "sent") break
                         throw BleException("Reader stopped sending mid-download")
                     }
+                    val frame = event as? DataFrame ?: continue
                     if (frame.sequence != expected) {
                         throw BleException(
                             "Out-of-order frame: got ${frame.sequence}, expected $expected"
@@ -1512,9 +1713,13 @@ class BleClient(private val context: Context) {
                 runCatching { writeControl(JSONObject().put("op", "cancel")) }
                 throw e
             } finally {
-                pump.cancel()
+                framePump.cancel()
+                statusPump.cancel()
                 queue.close()
             }
+        }
+        } finally {
+            releaseFastLink()
         }
 
         val out = ByteArray(received.toInt())

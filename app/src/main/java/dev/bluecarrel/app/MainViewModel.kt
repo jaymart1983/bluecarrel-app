@@ -23,6 +23,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -48,6 +49,8 @@ data class TransferProgress(
     val label: String,
     val sent: Long,
     val total: Long,
+    /** Bluetooth rate, shown beside the percentage when above 0. */
+    val kbps: Int = 0,
 ) {
     val fraction: Float get() = if (total > 0) (sent.toFloat() / total).coerceIn(0f, 1f) else 0f
 }
@@ -248,6 +251,12 @@ data class UiState(
     val storedHostId: String? = null,
     /** Store diagnostics: what the app has seen and done about reader requests. */
     val storeTrace: String = "no request seen",
+    /** The last sync, one line per step. Diagnostics. */
+    val syncTrace: List<String> = emptyList(),
+    /** The sync before it. */
+    val previousSyncTrace: List<String> = emptyList(),
+    /** MTU, PHY and connection priority as last reported. Diagnostics. */
+    val linkInfo: String = "",
 ) {
     val connected: Boolean get() = connection == BleConnection.CONNECTED
 
@@ -282,6 +291,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val CATALOGUE_STALE_MS = 60 * 60_000L
         /** kosync lookups in flight at once during a position pass. */
         const val PREFETCH_PARALLEL = 8
+        /** A book whose reader save is unchanged is looked up in kosync again after this. */
+        const val KOSYNC_RECHECK_MS = 5 * 60_000L
+        /** Positions in a kept listing are re-read after this even with no heartbeat. */
+        const val LISTING_POSITIONS_TTL_MS = 5 * 60_000L
+        /** A new library fingerprint this soon after this app's own send or removal is that change. */
+        const val LIBRARY_ECHO_MS = 15_000L
         /** A connect re-checks the update page at most this often. */
         const val FIRMWARE_CHECK_MS = 10 * 60_000L
         /** While connected, the update page is re-checked this often (network only). */
@@ -372,7 +387,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** The reader already told, this process, that its unknown books were kept. */
     private var keptAnnouncedFor: String? = null
 
+    // --- sync trace -------------------------------------------------------------
+    // Declared ahead of init: init connects, and a connect records into these.
+
+    /** The sync being recorded; null between syncs. */
+    private var activeTrace: SyncTrace? = null
+    /** The traces whose lines [UiState.syncTrace] and [UiState.previousSyncTrace] show. */
+    private var shownTrace: SyncTrace? = null
+    private var previousTrace: SyncTrace? = null
+    /** Network work a sync started and does not wait for; its trace closes after this. */
+    private val traceWork = mutableListOf<Job>()
+
     init {
+        // PHY and priority reports arrive on Bluetooth threads.
+        ble.onLinkEvent = { text ->
+            viewModelScope.launch {
+                traceNote("link", text)
+                _state.value = _state.value.copy(
+                    linkInfo = "mtu ${ble.negotiatedMtu}, phy ${ble.phy ?: "?"}, " +
+                        "priority ${if (ble.fastLink) "high" else "balanced"}",
+                )
+            }
+        }
         store.attach(viewModelScope)
         superviseLink()
         pollFirmware()
@@ -494,6 +530,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 s.bookFilename?.let { filename ->
                     s.bookPercent?.let { pct ->
                         applyReaderPosition(filename, pct)
+                        // A kept listing's position for this book is no longer current.
+                        noteHeartbeatForListing(filename, pct)
                         // ...and published: the same ping is what keeps kosync
                         // current while reading, not just the row on screen.
                         queueHeartbeatPosition(filename, pct)
@@ -515,8 +553,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         // Not on the first sighting: connecting already runs a
                         // mirror, and firing a second one on the status that
                         // arrives moments later would double every connection.
-                        if (!first && _state.value.connected && _state.value.authorized) {
-                            mirrorToDevice()
+                        //
+                        // Nor for this app's own send or removal coming back: the
+                        // kept listing already says so, and a mirror for it would
+                        // be one more pass and one more listing download.
+                        val echo = System.currentTimeMillis() < libraryEchoUntil
+                        if (!first && !echo) {
+                            invalidateReaderListing()
+                            if (_state.value.connected && _state.value.authorized) mirrorToDevice()
                         }
                     }
                 }
@@ -566,6 +610,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // An explicit refresh is the user saying they do not trust the cached
         // answer, so the reader's library fingerprint is forgotten first.
         lastLibraryFingerprint = null
+        invalidateReaderListing()
+        kosyncSettled.clear()
         // No settings: the reader-settings screen loads them when it opens, and
         // nothing else reads them.
         return requestSync(catalogue = true)
@@ -660,13 +706,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         // Never bonds here: a background reconnect must not raise a pairing dialog.
+        val connectStarted = System.currentTimeMillis()
         val outcome = runCatching { ble.connect(address, allowBond = false) }
         val status = outcome.getOrElse { e ->
             failLink(e, silent)
             return@launch
         }
+        // Recorded only once the link is up: the watchdog retries every few seconds
+        // while the reader is away, and those attempts are not syncs.
+        val trace = beginTrace(startedAt = connectStarted)
+        trace.add(
+            "connect", connectStarted, System.currentTimeMillis() - connectStarted,
+            note = "mtu ${ble.negotiatedMtu}",
+        )
+        publishTrace(trace)
 
         if (identity.deviceId != null && status.deviceId != identity.deviceId) {
+            closeTraceWhenIdle(trace)
             ble.disconnect()
             _state.value = _state.value.copy(
                 authorized = false,
@@ -680,7 +736,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         _state.value = _state.value.copy(link = LinkStatus(LinkStage.PAIRING))
-        val ok = runCatching { ble.authenticate(identity) }.getOrDefault(false)
+        val ok = runCatching {
+            traced<Boolean>("auth", note = { if (it) "ok" else "refused" }) { ble.authenticate(identity) }
+        }.getOrDefault(false)
+        if (!ok) closeTraceWhenIdle(trace)
         if (ok) {
             onAuthorized(silent)
         } else if (readerForgotPhone()) {
@@ -926,6 +985,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         linkFailStreak = 0
         // A new session may be a different reader or new firmware.
         aboutFeatures = null
+        aboutDoc = null
+        invalidateReaderListing()
         _state.value = _state.value.copy(
             authorized = true,
             pairing = PairingState.TRUSTED,
@@ -939,16 +1000,108 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** What every newly authorised session does: clock, shelf, catalogue, firmware. */
     private fun startConnectedWork() {
+        beginTrace()
         viewModelScope.launch {
             // The reader has no clock of its own worth trusting; tell it the
             // time and the zone before anything else uses a timestamp.
-            runCatching { ble.setDeviceTime() }
+            runCatching { traced("set time") { ble.setDeviceTime() } }
             // The shelf is the contract: whatever is saved offline belongs on the
             // reader, so a fresh connection is the moment to make that true.
             requestSync(positions = true)
             refreshCatalogueIfStale()
             checkFirmwareOnConnect()
             resumeInterruptedFirmware()
+        }
+    }
+
+    // --- sync trace -------------------------------------------------------------
+
+    /** What was shown before the running trace took over; put back if it records nothing. */
+    private var shownBefore: Pair<SyncTrace?, SyncTrace?> = null to null
+
+    /** Starts recording a sync, or returns the one already recording. */
+    private fun beginTrace(startedAt: Long = System.currentTimeMillis()): SyncTrace {
+        activeTrace?.let { return it }
+        val t = SyncTrace(startedAt)
+        activeTrace = t
+        traceWork.clear()
+        shownBefore = shownTrace to previousTrace
+        if (shownTrace != null) previousTrace = shownTrace
+        shownTrace = t
+        showTraces()
+        return t
+    }
+
+    private fun showTraces() {
+        _state.value = _state.value.copy(
+            syncTrace = shownTrace?.lines().orEmpty(),
+            previousSyncTrace = previousTrace?.lines().orEmpty(),
+        )
+    }
+
+    private fun publishTrace(t: SyncTrace) {
+        when {
+            t === shownTrace -> _state.value = _state.value.copy(syncTrace = t.lines())
+            t === previousTrace -> _state.value = _state.value.copy(previousSyncTrace = t.lines())
+        }
+    }
+
+    private fun traceNote(name: String, note: String) {
+        val t = activeTrace ?: return
+        t.event(name, note)
+        publishTrace(t)
+    }
+
+    /** Runs [block] as one step of the sync being recorded; just runs it when none is. */
+    private suspend fun <T> traced(
+        name: String,
+        bytes: (T) -> Long = { 0L },
+        note: (T) -> String = { "" },
+        block: suspend () -> T,
+    ): T {
+        val t = activeTrace ?: return block()
+        val started = System.currentTimeMillis()
+        try {
+            val result = block()
+            t.add(name, started, System.currentTimeMillis() - started, bytes(result), note(result))
+            publishTrace(t)
+            return result
+        } catch (e: Throwable) {
+            val why = if (e is CancellationException) "cancelled"
+            else "failed: " + (e.message ?: e.javaClass.simpleName).take(60)
+            t.add(name, started, System.currentTimeMillis() - started, 0L, why)
+            publishTrace(t)
+            throw e
+        }
+    }
+
+    /** Network work the sync being recorded started and does not wait for. */
+    private fun trackWork(job: Job?) {
+        if (job != null && activeTrace != null) traceWork += job
+    }
+
+    /** Closes [t] once the sync and the work it started have finished. */
+    private fun closeTraceWhenIdle(t: SyncTrace) {
+        viewModelScope.launch {
+            while (activeTrace === t) {
+                val waiting = traceWork.filter { it.isActive } + listOfNotNull(syncJob?.takeIf { it.isActive })
+                if (waiting.isEmpty()) break
+                waiting.joinAll()
+            }
+            if (activeTrace === t) {
+                t.finish()
+                activeTrace = null
+                traceWork.clear()
+                // A pass that did nothing (a heartbeat with nothing to send) does not
+                // push the last real sync out of view.
+                if (t.isEmpty() && shownTrace === t) {
+                    shownTrace = shownBefore.first
+                    previousTrace = shownBefore.second
+                    showTraces()
+                } else {
+                    publishTrace(t)
+                }
+            }
         }
     }
 
@@ -1084,7 +1237,194 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _state.value.device?.deviceId ?: pairingStore.load()?.deviceId
 
     /**
-     * Publishes the reader's reading positions to kosync.
+     * The reader-facing half of a position sync, and nothing that waits on the
+     * network: resumes the user chose that the reader has not confirmed, and
+     * server positions an earlier kosync pass found for it, in one `progress`
+     * batch. Then, when [runKosync], the kosync half ([runKosyncPass]) starts
+     * beside whatever the sync does next.
+     */
+    private suspend fun positionsPass(runKosync: Boolean) {
+        if (!_state.value.connected || !_state.value.authorized) return
+        if (_state.value.syncingProgress) return
+        _state.value = _state.value.copy(syncingProgress = true)
+        try {
+            val entries = readerLibrary(forPositions = true)
+            if (entries == null) {
+                _state.value = _state.value.copy(message = "Could not read the reader's library")
+                return
+            }
+
+            // Resumes the user chose that the reader has not confirmed. See OwedResumeStore.
+            val readerKey = deviceKey()
+            val owed = owedResumes.load(readerKey)
+            val freshStarts = startFresh.load(readerKey)
+            val nowSeconds = System.currentTimeMillis() / 1000
+            val toDevice = mutableListOf<JSONObject>()
+            // filename -> the timestamp its owed resume went out with in this batch.
+            val owedSent = mutableMapOf<String, Long>()
+            // Entries the owed-resume rules leave to the kosync pass.
+            val forKosync = mutableListOf<JSONObject>()
+
+            for (entry in entries) {
+                val filename = entry.optString("filename").ifBlank { null } ?: continue
+
+                // OWED RESUME, ahead of everything that needs a saved position: a book
+                // sent and never opened has no `location` or `timestamp` at all, and it
+                // is exactly the book a resume is owed to.
+                //
+                // Sent only while the reader is below OWED_RESUME_UNREAD (2%). Below
+                // that the book has at most been opened, and the user's explicit answer
+                // outranks it. At or above it the user has read on the reader since, so
+                // the choice is dropped and the ordinary rules apply.
+                //
+                // Stamped past the reader's own save, because the reader keeps a
+                // position only when its timestamp is strictly newer. The server row's
+                // set_at is days old and loses to a save made by merely opening the
+                // book -- which is how "resume at 89.5%" stayed at 0.1%.
+                val owedHere = owed[filename]
+                if (owedHere != null) {
+                    val readerPct = entry.optDouble("percent", 0.0).toFloat()
+                    val readerSavedAt = entry.optLong("timestamp", 0L)
+                    if (owedHere.appliedAt > 0L) {
+                        // Delivered. While the reader's save is still the one this app
+                        // wrote, it is the server's own position coming back: never
+                        // publish it as a new reading event. Any other save is the
+                        // user's, and from then on the ordinary rules apply.
+                        if (readerSavedAt == owedHere.appliedAt) continue
+                        owedResumes.forget(readerKey, filename)
+                    } else if (readerPct < OWED_RESUME_UNREAD) {
+                        val stamp = maxOf(nowSeconds, readerSavedAt + 1)
+                        toDevice += owedHere.positionJson(stamp).put("filename", filename)
+                        owedSent[filename] = stamp
+                        continue
+                    } else {
+                        owedResumes.forget(readerKey, filename)
+                    }
+                }
+                forKosync += entry
+            }
+
+            // Server positions the last kosync pass found for the reader. Not for a
+            // book owed a resume or restarted since; the reader keeps a position only
+            // when it is newer than its own, so a late one cannot drag it back.
+            val pulled = serverPositionsForReader.toMap()
+            serverPositionsForReader.clear()
+            val listed = entries.mapNotNull { it.optString("filename").ifBlank { null } }.toSet()
+            for ((filename, position) in pulled) {
+                if (filename in owedSent || filename in freshStarts || filename !in listed) continue
+                toDevice += position
+            }
+
+            if (toDevice.isNotEmpty()) {
+                val batch = JSONArray().apply { toDevice.forEach { put(it) } }.toString().toByteArray(Charsets.UTF_8)
+                lastProgressResults = null
+                val upload = runCatching {
+                    traced<BleClient.UploadResult>("positions", bytes = { it.bytes }, note = { "${toDevice.size} books" }) {
+                        ble.uploadBytes(batch, kind = "progress")
+                    }
+                }
+                if (upload.isFailure) {
+                    pulled.forEach { (f, p) -> if (f !in serverPositionsForReader) serverPositionsForReader[f] = p }
+                }
+                var owedNotice: String? = null
+                if (owedSent.isNotEmpty()) {
+                    val shelf = withContext(Dispatchers.IO) { books.cachedBooks() }.associateBy { it.filename }
+                    owedNotice = settleOwedResumes(readerKey, owedSent, owed, upload.exceptionOrNull(), shelf)
+                }
+                afterPositionBatch(owedSent, owed, othersSent = toDevice.size > owedSent.size, failed = upload.isFailure)
+                // Quiet inside a sync: one sync, one bar, no trailing report. The one
+                // exception is a resume waiting on the user to close the book.
+                if (owedNotice != null) _state.value = _state.value.copy(message = owedNotice)
+            }
+            if (owedSent.isEmpty()) {
+                // Nothing owed was eligible: none left, or each one was dropped above.
+                owedResumeDue = false
+                owedResumeBlocked = false
+            }
+            if (runKosync) startKosyncPass(forKosync, readerKey)
+        } finally {
+            _state.value = _state.value.copy(syncingProgress = false)
+        }
+    }
+
+    /**
+     * A resume the user chose, sent the moment its book has committed: before
+     * the removals, the positions step and any network work, so the first open
+     * on the reader lands on it. Not after a replace -- the reader may hold real
+     * reading there, and the positions step's 2% rule decides.
+     */
+    private suspend fun deliverOwedResumeNow(filename: String) {
+        if (!_state.value.connected || !_state.value.authorized) return
+        val readerKey = deviceKey()
+        val owed = owedResumes.load(readerKey)
+        val owedHere = owed[filename]?.takeIf { it.appliedAt == 0L } ?: return
+        val entry = readerEntries?.firstOrNull { it.optString("filename") == filename }
+        if ((entry?.optDouble("percent", 0.0) ?: 0.0).toFloat() >= OWED_RESUME_UNREAD) return
+        val stamp = maxOf(System.currentTimeMillis() / 1000, (entry?.optLong("timestamp", 0L) ?: 0L) + 1)
+        val batch = JSONArray().put(owedHere.positionJson(stamp).put("filename", filename))
+            .toString().toByteArray(Charsets.UTF_8)
+        lastProgressResults = null
+        val upload = runCatching {
+            traced<BleClient.UploadResult>("position", bytes = { it.bytes }, note = { "resume" }) {
+                ble.uploadBytes(batch, kind = "progress")
+            }
+        }
+        val shelf = withContext(Dispatchers.IO) { books.cachedBooks() }.associateBy { it.filename }
+        val sent = mapOf(filename to stamp)
+        val notice = settleOwedResumes(readerKey, sent, owed, upload.exceptionOrNull(), shelf)
+        afterPositionBatch(sent, owed, othersSent = false, failed = upload.isFailure)
+        if (notice != null) _state.value = _state.value.copy(message = notice)
+    }
+
+    /**
+     * Keeps the listing current after a position batch without downloading it
+     * again: an owed resume the reader reports `applied` is written into its
+     * entry, which is what the owed-resume rules compare against next time.
+     * Anything the app cannot account for marks positions stale instead, so the
+     * next positions step reads the listing afresh.
+     */
+    private fun afterPositionBatch(
+        owedSent: Map<String, Long>,
+        owed: Map<String, OwedResume>,
+        othersSent: Boolean,
+        failed: Boolean,
+    ) {
+        val results = lastProgressResults
+        if (othersSent || failed || (owedSent.isNotEmpty() && results == null)) readerPositionsStale = true
+        if (failed || results == null) return
+        for ((name, stamp) in owedSent) {
+            if (results[name] != "applied") continue
+            val pct = owed[name]?.percentage ?: continue
+            listingSetPosition(name, stamp, pct)
+        }
+    }
+
+    /** Server positions a kosync pass found that the reader should get; sent by the next positions step. */
+    private val serverPositionsForReader = mutableMapOf<String, JSONObject>()
+    private var kosyncJob: Job? = null
+    /**
+     * "reader/filename" -> the reader save a kosync pass last settled for that
+     * book, and when. A book whose reader save is unchanged is not looked up again
+     * within [KOSYNC_RECHECK_MS]. The server row has no cheap check, so the window
+     * is what bounds how late another client's newer position is seen; Refresh
+     * clears it.
+     */
+    private val kosyncSettled = mutableMapOf<String, Pair<String, Long>>()
+
+    /** Starts [runKosyncPass] beside the sync, unless one is already running. */
+    private fun startKosyncPass(entries: List<JSONObject>, readerKey: String?) {
+        lastPositionSyncAt = System.currentTimeMillis()
+        val c = _state.value.config
+        if (c.username.isBlank() || !c.serverConfigured) return
+        if (kosyncJob?.isActive == true) return
+        val job = viewModelScope.launch { runKosyncPass(entries, readerKey) }
+        kosyncJob = job
+        trackWork(job)
+    }
+
+    /**
+     * Publishes the reader's reading positions to kosync. Network only: the
+     * reader is never waited on here, and nothing on the reader waits on this.
      *
      * ## Where the numbers come from
      *
@@ -1103,9 +1443,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * older and would be suppressed on every book.
      *
      * So age comes from `set_at` inside the progress payload, which both this
-     * this app and any other well-behaved writer set for exactly this reason,
-     * and falls back
-     * to the receive time only when the payload has none. See [Progress.ageStamp].
+     * app and any other well-behaved writer set for exactly this reason, and
+     * falls back to the receive time only when the payload has none. See
+     * [Progress.ageStamp].
      *
      * ## What it will not do
      *
@@ -1119,135 +1459,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * cannot be shown to be newer than anything -- writing it would be a
      * last-writer-wins overwrite dressed up as a decision.
      */
-    fun syncProgressToKosync() = viewModelScope.launch {
+    private suspend fun runKosyncPass(entries: List<JSONObject>, readerKey: String?) {
         val c = _state.value.config
-        if (c.username.isBlank() || !c.serverConfigured) {
-            _state.value = _state.value.copy(message = "Set the server account first")
-            return@launch
-        }
-        if (!_state.value.connected || !_state.value.authorized) {
-            _state.value = _state.value.copy(message = "Connect the reader first")
-            return@launch
-        }
-        if (_state.value.syncingProgress) return@launch
-
-        // Reading the reader's library is itself a BLE download and is not
-        // instant, so the bar goes up BEFORE it rather than after.
-        _state.value = _state.value.copy(
-            syncingProgress = true,
-            transfer = TransferProgress("Syncing with reader…", 0, 0),
-        )
-        val listing = readerLibrary()
-        if (listing == null) {
-            _state.value = _state.value.copy(
-                syncingProgress = false,
-                transfer = null,
-                message = "Could not read the reader's library",
-            )
-            return@launch
-        }
-
-        // A BARE ARRAY -- see pruneDeviceBooksLocked.
-        val entries = runCatching {
-            val arr = JSONArray(String(listing, Charsets.UTF_8))
-            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
-        }.getOrElse { emptyList() }
-
         val kosync = KosyncClient(http, c.kosyncUrl, c.username, c.password)
-        val deviceId = deviceKey() ?: "x4pro"
+        val deviceId = readerKey ?: "x4pro"
         val deviceName = _state.value.deviceName.ifBlank { "X4 Pro" }
-
-        // Shown the same way a book transfer is. Each book costs a full-content
-        // hash plus a kosync GET and possibly a PUT, so a shelf of any size is
-        // seconds of silence otherwise -- and silence during a network operation
-        // is indistinguishable from nothing having happened.
-        _state.value = _state.value.copy(
-            transfer = TransferProgress("Syncing with reader…", 0, entries.size.toLong())
-        )
-
-        var written = 0
-        var skippedOlder = 0
-        var skippedNoClock = 0
-        var missingFile = 0
-        var sideLoaded = 0
-        var skippedNotAhead = 0
-        // Positions the server has that the reader does not. Built during the
-        // same walk, because it needs the same per-book facts (hash, device
-        // timestamp) that the push already computes.
-        val toDevice = mutableListOf<JSONObject>()
-        // Read once for the whole pass rather than per book: it is a DataStore
-        // round trip and the answer cannot change mid-walk.
-        val freshStarts = startFresh.load(deviceKey())
-        // Resumes the user chose that the reader has not confirmed. See OwedResumeStore.
-        val readerKey = deviceKey()
-        val owed = owedResumes.load(readerKey)
-        val nowSeconds = System.currentTimeMillis() / 1000
-        // filename -> the timestamp its owed resume went out with in this batch.
-        val owedSent = mutableMapOf<String, Long>()
-
-        // Every book's kosync lookups, fetched TOGETHER before the walk. They ran
-        // one after another -- two round trips per book through Cloudflare, about
-        // eleven for a three-book shelf -- and that was most of a connect sync.
-        // The walk below decides with the answers already in hand. Hashes come
-        // from the same cache the heartbeat writes use.
+        // Read once for the whole pass rather than per book: a DataStore round trip.
+        val freshStarts = startFresh.load(readerKey)
         val cachedShelf = withContext(Dispatchers.IO) { books.cachedBooks() }.associateBy { it.filename }
-        val prefetched: Map<String, Pair<String, Progress?>> = coroutineScope {
-            entries.mapNotNull { entry ->
-                val filename = entry.optString("filename").ifBlank { null } ?: return@mapNotNull null
-                if (!entry.optBoolean("fromApp", true)) return@mapNotNull null
-                val local = cachedShelf[filename] ?: return@mapNotNull null
-                val hash = heartbeatHash(local) ?: return@mapNotNull null
-                Triple(filename, local, hash)
-            }.chunked(PREFETCH_PARALLEL).flatMap { chunk ->
-                chunk.map { (filename, local, hash) ->
-                    async { filename to (hash to kosync.progressFor(local.progressKey, hash, deviceName, deviceId)) }
-                }.awaitAll()
-            }.toMap()
+        val startedAt = System.currentTimeMillis()
+
+        class Candidate(
+            val filename: String,
+            val local: Book,
+            val hash: String,
+            val location: String,
+            val savedAt: Long,
+            val percent: Float,
+        ) {
+            val memo: String get() = "$savedAt|$percent|$location"
         }
 
-        for ((index, entry) in entries.withIndex()) {
-            // Counted in BOOKS EXAMINED, not books written. Most of the wait is
-            // hashing and GETting books that turn out to need nothing, so a bar
-            // that only moved on a write would sit still through the slow part.
-            _state.value = _state.value.copy(
-                transfer = TransferProgress("Syncing with reader…", index.toLong(), entries.size.toLong())
-            )
+        var skippedNoClock = 0
+        var sideLoaded = 0
+        var missingFile = 0
+        var unchanged = 0
+        val candidates = mutableListOf<Candidate>()
+        for (entry in entries) {
             val filename = entry.optString("filename").ifBlank { null } ?: continue
-
-            // OWED RESUME, ahead of everything that needs a saved position: a book
-            // sent and never opened has no `location` or `timestamp` at all, and it
-            // is exactly the book a resume is owed to.
-            //
-            // Sent only while the reader is below OWED_RESUME_UNREAD (2%). Below
-            // that the book has at most been opened, and the user's explicit answer
-            // outranks it. At or above it the user has read on the reader since, so
-            // the choice is dropped and the ordinary rules below apply.
-            //
-            // Stamped past the reader's own save, because the reader keeps a
-            // position only when its timestamp is strictly newer. The server row's
-            // set_at is days old and loses to a save made by merely opening the
-            // book -- which is how "resume at 89.5%" stayed at 0.1%.
-            val owedHere = owed[filename]
-            if (owedHere != null) {
-                val readerPct = entry.optDouble("percent", 0.0).toFloat()
-                val readerSavedAt = entry.optLong("timestamp", 0L)
-                if (owedHere.appliedAt > 0L) {
-                    // Delivered. While the reader's save is still the one this app
-                    // wrote, it is the server's own position coming back: never
-                    // publish it as a new reading event. Any other save is the
-                    // user's, and from then on the ordinary rules apply.
-                    if (readerSavedAt == owedHere.appliedAt) continue
-                    owedResumes.forget(readerKey, filename)
-                } else if (readerPct < OWED_RESUME_UNREAD) {
-                    val stamp = maxOf(nowSeconds, readerSavedAt + 1)
-                    toDevice += owedHere.positionJson(stamp).put("filename", filename)
-                    owedSent[filename] = stamp
-                    continue
-                } else {
-                    owedResumes.forget(readerKey, filename)
-                }
-            }
-
             val location = entry.optString("location").ifBlank { null } ?: continue
             // Omitted rather than zeroed by the device when unknown -- see
             // BookLibraryIndex::writeEntry. Absent means the clock was unset.
@@ -1256,26 +1495,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 skippedNoClock++
                 continue
             }
-            val percent = entry.optDouble("percent", 0.0).toFloat()
-
             // Side-loaded books keep their progress to themselves.
             //
             // `fromApp` is the reader's own answer, from whether the phone's
             // metadata sidecar sits beside the book -- not a guess from what
             // this phone happens to be holding today. A book copied on over USB
             // has no Calibre original behind it, so there is nothing on the
-            // server for its position to belong to: publishing it would key a
-            // row to a file no other client will ever hold.
+            // server for its position to belong to.
             //
             // Older firmware omits the field. Absent is treated as "from the
             // app", because that was the only way a book could arrive before
-            // USB Drive existed, and defaulting the other way would silently
-            // stop syncing every book on a reader that had not been updated.
+            // USB Drive existed.
             if (!entry.optBoolean("fromApp", true)) {
                 sideLoaded++
                 continue
             }
-
             // The kosync key is the partial-MD5 of the FILE, so the bytes have
             // to be here too. `fromApp` says a Calibre original exists; it does
             // not say this phone still has the copy.
@@ -1284,18 +1518,49 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 missingFile++
                 continue
             }
-            val hash = prefetched[filename]?.first ?: heartbeatHash(local)
-            // Not `?: run { ...; continue }`: a continue inside an inline lambda
-            // is an experimental Kotlin feature and does not compile here.
+            val hash = heartbeatHash(local)
             if (hash == null) {
                 missingFile++
                 continue
             }
+            val candidate = Candidate(
+                filename, local, hash, location, savedAt, entry.optDouble("percent", 0.0).toFloat(),
+            )
+            val settled = kosyncSettled["$readerKey/$filename"]
+            if (settled != null && settled.first == candidate.memo && startedAt - settled.second < KOSYNC_RECHECK_MS) {
+                unchanged++
+                continue
+            }
+            candidates += candidate
+        }
 
-            val remote = if (prefetched.containsKey(filename)) prefetched.getValue(filename).second
-            else kosync.progressFor(local.progressKey, hash, deviceName, deviceId)
+        // Every lookup at once, PREFETCH_PARALLEL in flight: two round trips per
+        // book through Cloudflare, one after another, was most of a sync.
+        val remotes: Map<String, Progress?> = if (candidates.isEmpty()) emptyMap() else {
+            traced<Map<String, Progress?>>("kosync lookups", note = { "${candidates.size} books, $unchanged unchanged" }) {
+                coroutineScope {
+                    candidates.chunked(PREFETCH_PARALLEL).flatMap { chunk ->
+                        chunk.map { cand ->
+                            async { cand.filename to kosync.progressFor(cand.local.progressKey, cand.hash, deviceName, deviceId) }
+                        }.awaitAll()
+                    }.toMap()
+                }
+            }
+        }
+
+        var skippedOlder = 0
+        var skippedNotAhead = 0
+        val puts = mutableListOf<Candidate>()
+        val pulls = mutableMapOf<String, JSONObject>()
+        val settledNow = mutableListOf<Candidate>()
+        for (cand in candidates) {
+            val filename = cand.filename
+            val savedAt = cand.savedAt
+            val percent = cand.percent
+            val remote = remotes[filename]
             if (remote != null && remote.ageStamp >= savedAt) {
                 skippedOlder++
+                settledNow += cand
                 continue
             }
 
@@ -1305,51 +1570,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The timestamp rule alone decides who wrote last, not who is
             // further on, and "last" is the wrong question when a sync jams: a
             // stale position that arrives late is still newer by the clock and
-            // would drag every other client back to it. One bad write then
-            // propagates, because the next device to sync sees the regressed
-            // row as authoritative.
+            // would drag every other client back to it.
             //
-            // Monotonic is the only rule that cannot lose a page. It costs the
-            // deliberate cases -- re-reading a chapter, or restarting a book,
-            // will not publish -- and after a handoff from another client this
-            // reader must read PAST that client's percentage before it will
-            // publish again, since the two measure percentage differently. That
-            // is the price of never going backwards, and it is the trade the
-            // user asked for.
             // The reverse direction, decided with the same two facts. The reader
-            // gets a position only when the server's is NEWER and NOT BEHIND --
-            // the same forward-only rule, applied the other way round, so a
-            // stale server row cannot drag the reader backwards either.
-            //
-            // No `location` is sent. The server's position string is whatever
-            // wrote it, and another reading system's position encoding indexes
-            // a file this reader will never hold. The spine fields are the part
-            // that means anything here, and the reader ignores them unless its
+            // gets a position only when the server's is NEWER and NOT BEHIND.
+            // No `location` is sent: another reading system's position encoding
+            // indexes a file this reader will never hold. The spine fields are the
+            // part that means anything here, and the reader ignores them unless its
             // own spine count matches `spine_n`.
-            // A book the user chose to restart is not pushed back to its old
-            // position. The forward-only rule would otherwise make the server's
-            // 43% beat the reader's page one every single sync, so "start from
-            // the beginning" would survive for about as long as it took the
-            // next sync to run.
             //
-            // The instruction is spent as soon as the reader has a position of
-            // its own: the user has read something, the reader is now the newer
-            // authority, and ordinary syncing takes over again.
+            // A book the user chose to restart is not pushed back to its old
+            // position. The instruction is spent as soon as the reader has a
+            // position of its own.
             if (filename in freshStarts) {
-                if (percent > 0f) startFresh.forget(deviceKey(), filename)
+                if (percent > 0f) startFresh.forget(readerKey, filename)
             } else if (remote != null && remote.ageStamp > savedAt) {
                 val payload = remote.payloadJson()
                 val spine = payload?.optInt("spine", -1) ?: -1
                 val spineN = payload?.optInt("spine_n", 0) ?: 0
                 val remotePct = remote.percentage
                 if (remotePct + 0.00005f >= percent) {
-                    toDevice += JSONObject().apply {
+                    pulls[filename] = JSONObject().apply {
                         put("filename", filename)
                         put("timestamp", remote.ageStamp)
-                        // Sent with the position, not left to the device. The
-                        // reader's library screen reads its percentage out of
-                        // the sidecar written here, so omitting it stored 0 and
-                        // ERASED the percentage rather than leaving it alone.
+                        // Sent with the position, not left to the device: the
+                        // reader's library screen reads its percentage out of the
+                        // sidecar written here.
                         put("pct", remotePct.coerceIn(0f, 1f).toDouble())
                         if (spine >= 0 && spineN > 0) {
                             put("spine", spine)
@@ -1361,89 +1607,68 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // Compared at STORAGE precision, and blocking only a strictly lower
-            // value. Both details matter.
-            //
-            // `percent` is the device's own figure, rounded to four decimals
-            // before it left the reader. `remote.percentage` has been through
-            // CWA's 0-100 conversion and back. Comparing those two floats raw
-            // means float noise decides the outcome: if the round trip nudges
-            // the stored value UP, `<=` blocks that book forever; if it nudges
-            // DOWN, every sync rewrites it.
-            //
-            // Strictly-lower rather than not-greater, because reaching here
-            // already means this device's save is NEWER (the set_at check
-            // above). Rewriting an equal percentage with a corrected timestamp
-            // loses no reading and is how a stale row gets repaired; blocking
-            // it is what makes a book unfixable.
+            // value. `percent` is the device's own figure, rounded to four
+            // decimals; `remote.percentage` has been through CWA's 0-100
+            // conversion and back, so raw floats would let noise decide.
+            // Strictly-lower, because reaching here already means this device's
+            // save is NEWER: rewriting an equal percentage with a corrected
+            // timestamp is how a stale row gets repaired.
             val mine = Math.round(percent * 10_000f) / 10_000f
             val theirs = Math.round(remote?.percentage?.times(10_000f) ?: 0f) / 10_000f
             if (remote != null && mine < theirs) {
                 skippedNotAhead++
+                settledNow += cand
                 continue
             }
-
-            if (kosync.putProgressFor(
-                    stableKey = local.progressKey,
-                    contentHash = hash,
-                    position = location,
-                    percentage = percent,
-                    setAt = savedAt,
-                    deviceName = deviceName,
-                    deviceId = deviceId,
-                )
-            ) {
-                written++
-            }
+            puts += cand
         }
+
+        var written = 0
+        if (puts.isNotEmpty()) {
+            val landed = traced<List<Candidate>>("kosync puts", note = { "${it.size} of ${puts.size} written" }) {
+                coroutineScope {
+                    puts.chunked(PREFETCH_PARALLEL).flatMap { chunk ->
+                        chunk.map { cand ->
+                            async {
+                                cand.takeIf {
+                                    kosync.putProgressFor(
+                                        stableKey = cand.local.progressKey,
+                                        contentHash = cand.hash,
+                                        position = cand.location,
+                                        percentage = cand.percent,
+                                        setAt = cand.savedAt,
+                                        deviceName = deviceName,
+                                        deviceId = deviceId,
+                                    )
+                                }
+                            }
+                        }.awaitAll().filterNotNull()
+                    }
+                }
+            }
+            written = landed.size
+            // A failed write is not settled, so the next pass tries it again.
+            settledNow += landed
+        }
+        for (cand in settledNow) kosyncSettled["$readerKey/${cand.filename}"] = cand.memo to startedAt
+        lastPositionSyncAt = System.currentTimeMillis()
+        traceNote(
+            "kosync",
+            "written $written, current $skippedOlder, not ahead $skippedNotAhead, unchanged $unchanged, " +
+                "unstamped $skippedNoClock, not on phone $missingFile, side-loaded $sideLoaded",
+        )
 
         // ---------------------------------------------------------------- pull
         //
-        // The other half. Everything above publishes what the READER knows; this
-        // sends back what the SERVER knows and the reader does not.
-        //
-        // Without it a position written to CWA by anything else would show on
-        // the library row and never reach the reader.
-        var pushed = 0
-        var owedNotice: String? = null
-        if (toDevice.isNotEmpty()) {
-            _state.value = _state.value.copy(
-                transfer = TransferProgress("Syncing with reader…", 0, toDevice.size.toLong())
-            )
-            val batch = JSONArray().apply { toDevice.forEach { put(it) } }.toString()
-            val upload = runCatching {
-                ble.uploadBytes(batch.toByteArray(Charsets.UTF_8), kind = "progress")
-            }
-            if (upload.isSuccess) pushed = toDevice.size
-            invalidateReaderListing()
-            if (owedSent.isNotEmpty()) {
-                owedNotice = settleOwedResumes(readerKey, owedSent, owed, upload.exceptionOrNull(), cachedShelf)
-            }
+        // What the SERVER knows and the reader does not goes to the reader in the
+        // next positions step, which this asks for.
+        if (pulls.isNotEmpty() && _state.value.connected && _state.value.authorized) {
+            serverPositionsForReader.putAll(pulls)
+            requestSync(positions = true)
         }
-        if (owedSent.isEmpty()) {
-            // Nothing owed was eligible: none left, or each one was dropped above.
-            owedResumeDue = false
-            owedResumeBlocked = false
-        }
-        lastPositionSyncAt = System.currentTimeMillis()
 
-        _state.value = _state.value.copy(
-            syncingProgress = false,
-            transfer = null,
-            // Quiet inside a sync: one sync, one bar, no trailing report. The one
-            // exception is a resume waiting on the user to close the book.
-            message = owedNotice ?: if (syncJob?.isActive == true) _state.value.message else buildString {
-                append("Synced $written position")
-                if (written != 1) append("s")
-                if (skippedOlder > 0) append(", $skippedOlder already current")
-                if (skippedNoClock > 0) append(", $skippedNoClock unstamped")
-                if (missingFile > 0) append(", $missingFile not on this phone")
-                if (sideLoaded > 0) append(", $sideLoaded side-loaded")
-                if (skippedNotAhead > 0) append(", $skippedNotAhead not ahead")
-                if (pushed > 0) append("; sent $pushed to the reader")
-            }
-        )
         // Positions moved, so the percentages on the shelf are stale.
-        loadLibrary()
+        loadLibrary().join()
     }
 
     // ---------------------------------------------------------------- store
@@ -1527,7 +1752,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(loading = true, message = null)
 
         val result = runCatching {
-            OpdsClient(http, c.opdsUrl, c.username, c.password).feed(FEED_PATH)
+            traced<List<Book>>("catalogue", note = { "${it.size} books" }) {
+                OpdsClient(http, c.opdsUrl, c.username, c.password).feed(FEED_PATH)
+            }
         }
 
         result.onSuccess { feedBooks ->
@@ -1535,24 +1762,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val cachedNames = books.cachedNames()
             val sent = sentBooks.load(deviceKey())
             val canSync = c.username.isNotBlank()
-            val rows = feedBooks.map { book ->
-                val cached = cachedNames.contains(book.filename)
-                // CONTENT hashing needs the bytes, so only a downloaded book
-                // has an id the server can match. See [KoreaderHash].
-                val hash = if (cached) {
-                    runCatching { KoreaderHash.fromContent(books.fileFor(book)) }
-                        .getOrNull()
-                } else null
-                BookRow(
-                    book = book,
-                    progress = (
-                        if (canSync && hash != null) {
-                            kosync.progressFor(book.progressKey, hash, kosyncDeviceName(), kosyncDeviceId())
-                        } else null
-                        ) ?: knownProgressFor(book.filename),
-                    sentFromThisApp = book.filename in sent,
-                    cached = cached,
-                )
+            val deviceName = kosyncDeviceName()
+            val deviceId = kosyncDeviceId()
+            val cachedCount = feedBooks.count { cachedNames.contains(it.filename) }
+            // PREFETCH_PARALLEL lookups at a time, not one book after another.
+            val rows = traced<List<BookRow>>("catalogue progress", note = { "$cachedCount books" }) {
+                coroutineScope {
+                    feedBooks.chunked(PREFETCH_PARALLEL).flatMap { chunk ->
+                        chunk.map { book ->
+                            async {
+                                val cached = cachedNames.contains(book.filename)
+                                // CONTENT hashing needs the bytes, so only a downloaded book
+                                // has an id the server can match. See [KoreaderHash].
+                                val hash = if (cached) heartbeatHash(book) else null
+                                BookRow(
+                                    book = book,
+                                    progress = (
+                                        if (canSync && hash != null) {
+                                            kosync.progressFor(book.progressKey, hash, deviceName, deviceId)
+                                        } else null
+                                        ) ?: knownProgressFor(book.filename),
+                                    sentFromThisApp = book.filename in sent,
+                                    cached = cached,
+                                )
+                            }
+                        }.awaitAll()
+                    }
+                }
             }
             _state.value = _state.value.copy(rows = rows, loading = false)
             lastCatalogueAt = System.currentTimeMillis()
@@ -1569,11 +1805,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (changed.isNotEmpty()) {
                 changed.filter { c -> calibreQueue.none { it.filename == c.filename } }
                     .let { calibreQueue.addAll(it) }
-                // A pass that is awaiting this refresh drains the queue right after
-                // it returns. Otherwise ask -- including when a sync is running but
-                // did not start this refresh (the stale-catalogue refresh a connect
-                // launches alongside it): requestSync() then earns one more lap.
-                if (!catalogueJoining) requestSync()
+                // Nothing waits on this refresh: a running sync earns one more
+                // lap for the changes, and otherwise this starts one.
+                requestSync()
             }
 
             // The shelf does not come from the feed, but a catalogue refresh is
@@ -1687,19 +1921,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val known = _state.value.library.associate { it.book.filename to it.progress }
 
         val saved = withContext(Dispatchers.IO) { books.cachedBooks() }
-        val rows = saved.map { book ->
-            // CONTENT hashing needs the bytes, which by definition we have.
-            val hash = if (canSync) {
-                withContext(Dispatchers.IO) {
-                    runCatching { KoreaderHash.fromContent(books.fileFor(book)) }
-                        .getOrNull()
+        // filename -> the server's position, for each book that could be hashed.
+        // PREFETCH_PARALLEL lookups at a time, not one book after another.
+        val fetched: Map<String, Progress?> = if (!canSync || saved.isEmpty()) emptyMap() else {
+            val deviceName = kosyncDeviceName()
+            val deviceId = kosyncDeviceId()
+            traced<Map<String, Progress?>>("shelf progress", note = { "${saved.size} books" }) {
+                coroutineScope {
+                    saved.chunked(PREFETCH_PARALLEL).flatMap { chunk ->
+                        chunk.map { book ->
+                            async {
+                                // CONTENT hashing needs the bytes, which by definition we have.
+                                heartbeatHash(book)?.let { hash ->
+                                    book.filename to kosync.progressFor(book.progressKey, hash, deviceName, deviceId)
+                                }
+                            }
+                        }.awaitAll().filterNotNull()
+                    }.toMap()
                 }
-            } else null
+            }
+        }
+        val rows = saved.map { book ->
             BookRow(
                 book = book,
-                progress = if (canSync && hash != null) {
-                    kosync.progressFor(book.progressKey, hash, kosyncDeviceName(), kosyncDeviceId())
-                } else known[book.filename],
+                progress = if (fetched.containsKey(book.filename)) fetched[book.filename] else known[book.filename],
                 sentFromThisApp = book.filename in sent,
                 cached = true,
                 pendingRemoval = book.filename in owed,
@@ -1754,7 +1999,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // that may predate the save that triggered this. Shelf only: what goes to
         // the reader does not depend on how far it has been read.
         loadLibrary(withProgress = false).join()
-        val pending = libraryRows().filter { !it.sentFromThisApp }
+        // Not a book still coming down from Calibre: its file is not final yet.
+        val pending = libraryRows().filter { !it.sentFromThisApp && it.book.filename !in calibreUpdating }
+        // Covers come from Calibre, so they are fetched beside the sends, never ahead of them.
+        warmCovers(pending.map { it.book })
         var sentAny = false
         for (row in pending) {
             if (!_state.value.connected || !_state.value.authorized) break
@@ -1801,8 +2049,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (positions) syncWantPositions = true
         if (settings) syncWantSettings = true
         syncJob?.takeIf { it.isActive }?.let { return it }
+        val trace = beginTrace()
         val job = viewModelScope.launch {
             _state.value = _state.value.copy(syncingLibrary = true, syncStatus = "Syncing with reader\u2026")
+            // The shortest connection interval for the whole sync, not per request.
+            ble.holdFastLink()
             try {
                 while (syncPending) {
                     syncPending = false
@@ -1815,7 +2066,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     runSyncPass(cat, set, pos)
                 }
             } finally {
+                ble.releaseFastLink()
                 _state.value = _state.value.copy(syncingLibrary = false, syncStatus = null)
+                closeTraceWhenIdle(trace)
             }
         }
         syncJob = job
@@ -1823,30 +2076,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Everything, in the order each step depends on the last: the catalogue
-     * (so Calibre changes are known), the Calibre changes themselves (so the
-     * files on this phone are current), the clock (before any timestamp is
-     * written), settings, the books, then positions (meaningless for a book that
-     * has not arrived). One library listing is shared by the book and position
-     * steps -- see [readerLibrary].
+     * One pass. The reader's steps run back to back and never wait on the
+     * network: the books (each followed at once by a resume the user chose for
+     * it), the removals, then the positions batch -- all off one library listing,
+     * see [readerLibrary]. Server work starts beside them and is not awaited: the
+     * catalogue, Calibre changes, covers and kosync. What that work finds for the
+     * reader (a replaced book, a server position) asks for one more pass.
      */
     private suspend fun runSyncPass(catalogue: Boolean, settings: Boolean, positions: Boolean) {
-        if (catalogue) {
-            catalogueJoining = true
-            try {
-                refresh().join()
-            } finally {
-                catalogueJoining = false
-            }
-        }
+        // A refresh that finds Calibre changes asks for another pass itself.
+        if (catalogue) trackWork(refresh())
         val linked = _state.value.connected && _state.value.authorized
         if (linked) resendShelfOnce()
 
         val changes = calibreQueue.toList()
         calibreQueue.clear()
-        if (changes.isNotEmpty()) updateFromCalibre(changes)
+        if (changes.isNotEmpty()) startCalibreUpdates(changes)
 
         if (!_state.value.connected || !_state.value.authorized) return
+        // Only when asked for: nothing in a sync reads the reader's settings.
         if (settings) runCatching { loadDeviceSettings(force = true).join() }
 
         val sentAny = mirrorPass()
@@ -1855,9 +2103,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // on every small trigger: a page-turn-driven pass has nothing to add.
         val recent = System.currentTimeMillis() - lastPositionSyncAt < LISTING_TTL_MS
         // An owed resume skips the throttle: this pass is what it is waiting for.
-        if (sentAny || (positions && owedResumeDue) || ((catalogue || positions) && !recent)) {
-            if (!_state.value.syncingProgress) syncProgressToKosync().join()
-        }
+        val due = sentAny || (positions && owedResumeDue) || ((catalogue || positions) && !recent)
+        if (due || serverPositionsForReader.isNotEmpty()) positionsPass(runKosync = due)
     }
 
     /**
@@ -1966,13 +2213,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** filename -> outcome of the last `progress` batch, or null when the reader cannot say. */
     private suspend fun progressResults(): Map<String, String>? = runCatching {
-        val arr = JSONArray(String(ble.download("progress_result"), Charsets.UTF_8))
+        val bytes = traced<ByteArray>("progress_result", bytes = { it.size.toLong() }) {
+            ble.download("progress_result")
+        }
+        val arr = JSONArray(String(bytes, Charsets.UTF_8))
         (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
             val name = o.optString("filename").ifBlank { null } ?: return@mapNotNull null
             name to o.optString("result")
         }.toMap()
-    }.getOrNull()
+    }.getOrNull().also { lastProgressResults = it }
 
     /**
      * Whether this reader applies a `position` sent with a book: `book_position`
@@ -1980,14 +2230,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun readerTakesBookPosition(): Boolean {
         aboutFeatures?.let { return BOOK_POSITION in it }
-        val doc = runCatching { JSONObject(String(ble.download("about"), Charsets.UTF_8)) }
-        doc.getOrNull()?.let { rememberAboutFeatures(it) }
+        val doc = readAbout(fresh = false)
         // Firmware without the `about` kind has no features either. Any other
         // failure (a dropped link) is not an answer, so it is not cached.
         if ((doc.exceptionOrNull() as? BleClient.BleException)?.code == "unsupported transfer kind") {
             aboutFeatures = emptySet()
         }
         return aboutFeatures?.contains(BOOK_POSITION) == true
+    }
+
+    /**
+     * The reader's `about` document. One download per connection however many
+     * ask at once (the firmware check and the first send both do); [fresh] reads
+     * it again, for the Firmware screen and after an install.
+     */
+    private suspend fun readAbout(fresh: Boolean): Result<JSONObject> = aboutLock.withLock {
+        val cached = aboutDoc
+        if (!fresh && cached != null) return@withLock Result.success(cached)
+        val read = runCatching {
+            val bytes = traced<ByteArray>("about", bytes = { it.size.toLong() }) { ble.download("about") }
+            JSONObject(String(bytes, Charsets.UTF_8))
+        }
+        read.getOrNull()?.let { doc ->
+            aboutDoc = doc
+            rememberAboutFeatures(doc)
+        }
+        read
     }
 
     private fun rememberAboutFeatures(about: JSONObject) {
@@ -2123,7 +2391,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * One book. True when it is settled -- written, or deliberately skipped by
-     * the same rules [syncProgressToKosync] applies -- and false only when a
+     * the same rules [runKosyncPass] applies -- and false only when a
      * write was attempted and failed.
      *
      * No `pos` is sent: the ping carries the percentage only, and `pos` is
@@ -2143,7 +2411,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val local = books.cachedBooks().firstOrNull { it.filename == filename } ?: return true
         val hash = heartbeatHash(local) ?: return true
         val remote = kosync.progressFor(local.progressKey, hash, deviceName, deviceId)
-        // FORWARD ONLY, at storage precision -- see syncProgressToKosync. Equal
+        // FORWARD ONLY, at storage precision -- see runKosyncPass. Equal
         // is skipped too: there is nothing new to say.
         val mine = Math.round(pct * 10_000f) / 10_000f
         val theirs = Math.round((remote?.percentage ?: 0f) * 10_000f) / 10_000f
@@ -2226,15 +2494,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      *  - a revision that shortened the book: the reader clamps a saved spine
      *    index that no longer exists instead of opening past the end.
      */
-    private suspend fun updateFromCalibre(changed: List<Book>) {
+    private suspend fun updateFromCalibre(changed: List<Book>): Int {
         val c = _state.value.config
-        if (!c.serverConfigured) return
+        if (!c.serverConfigured) return 0
         val kosync = KosyncClient(http, c.kosyncUrl, c.username, c.password)
         val canSync = c.username.isNotBlank()
         var updated = 0
         var unchanged = 0
         for (feed in changed) {
-            if (feed.id in _state.value.busyBookIds) continue
+            if (feed.id in _state.value.busyBookIds) {
+                // Being saved or removed right now: left for a later pass, not dropped.
+                if (calibreQueue.none { it.filename == feed.filename }) calibreQueue += feed
+                continue
+            }
             markBusy(feed.id, true)
             try {
                 val target = books.fileFor(feed)
@@ -2258,19 +2530,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 //    old copy intact rather than a truncated book on the shelf.
                 //    Outside the books directory, which is read as the shelf.
                 val temp = File(getApplication<Application>().cacheDir, "calibre-update-" + target.name)
-                _state.value = _state.value.copy(
-                    transfer = TransferProgress("Syncing with reader\u2026", 0, 0),
-                )
+                showCalibreProgress(0, 0)
                 var sameBytes = false
                 val ok = runCatching {
                     OpdsClient(http, c.opdsUrl, c.username, c.password).download(feed, temp) { sent, total ->
-                        _state.value = _state.value.copy(
-                            transfer = TransferProgress(
-                                "Syncing with reader\u2026",
-                                sent,
-                                if (total > 0) total else sent,
-                            ),
-                        )
+                        showCalibreProgress(sent, if (total > 0) total else sent)
                     }
                     // 2. Did the BOOK change, or only its catalogue stamp?
                     //
@@ -2310,16 +2574,66 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 markBusy(feed.id, false)
             }
         }
-        _state.value = _state.value.copy(transfer = null)
+        if (_state.value.transfer?.label == CALIBRE_LABEL) _state.value = _state.value.copy(transfer = null)
         if (updated > 0) {
             _state.value = _state.value.copy(
                 message = if (updated == 1) "Updated \"${changed.first().title}\" from Calibre"
                 else "Updated $updated books from Calibre",
             )
-            // No mirror of its own: this runs inside a sync pass, and the pass
-            // sends the replaced books straight after.
+            // No mirror of its own: the pass startCalibreUpdates asks for sends
+            // the replaced books.
             loadLibrary(withProgress = false).join()
         }
+        return updated
+    }
+
+    private val CALIBRE_LABEL = "Updating from Calibre…"
+
+    /** The bar shows a Calibre download only when no reader transfer is using it. */
+    private fun showCalibreProgress(sent: Long, total: Long) {
+        val current = _state.value.transfer
+        if (current == null || current.label == CALIBRE_LABEL) {
+            _state.value = _state.value.copy(transfer = TransferProgress(CALIBRE_LABEL, sent, total))
+        }
+    }
+
+    private var calibreJob: Job? = null
+    /** Books being re-downloaded from Calibre. The mirror leaves them until the file is final. */
+    private val calibreUpdating = mutableSetOf<String>()
+    /** Changes that arrived while [calibreJob] ran. */
+    private var calibreMoreWanted = false
+
+    /**
+     * Runs [updateFromCalibre] beside the sync rather than inside it: each change
+     * is a whole book downloaded from Calibre, and the reader's steps must not
+     * wait on that. The pass it asks for when done sends what was replaced.
+     */
+    private fun startCalibreUpdates(changes: List<Book>) {
+        if (calibreJob?.isActive == true) {
+            changes.filter { c -> calibreQueue.none { it.filename == c.filename } }.let { calibreQueue.addAll(it) }
+            calibreMoreWanted = true
+            return
+        }
+        val names = changes.map { it.filename }.toSet()
+        calibreUpdating += names
+        val job = viewModelScope.launch {
+            val updated = try {
+                traced<Int>("calibre updates", note = { "$it of ${changes.size} replaced" }) {
+                    updateFromCalibre(changes)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                0
+            } finally {
+                calibreUpdating -= names
+            }
+            val more = calibreMoreWanted
+            calibreMoreWanted = false
+            if ((updated > 0 || more) && _state.value.connected && _state.value.authorized) requestSync()
+        }
+        calibreJob = job
+        trackWork(job)
     }
 
     /**
@@ -2365,18 +2679,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The reader's library listing, fetched once per sync instead of once per
-     * step.
+     * The reader's library listing, parsed: downloaded at most once per pass and
+     * kept while only this app changes the reader.
      *
-     * The prune needs it to see what to delete and the position sync needs it
-     * for positions; downloading it per step would mean several BLE downloads
-     * of the same few KB in under a minute. Reused for [LISTING_TTL_MS], and
-     * dropped the moment
-     * anything changes what it would say: a book sent or deleted, positions
-     * pushed.
+     * The prune needs it to see what to delete and the positions step needs it
+     * for positions. This app's own sends, removals and applied resumes are
+     * written into it here rather than downloading it again after each one.
+     * Dropped when the reader changes on its own: a library fingerprint that is
+     * not this app's echo, or a new session. Positions in it are re-read after a
+     * heartbeat moves one, or after [LISTING_POSITIONS_TTL_MS].
      */
-    private var readerListing: ByteArray? = null
-    private var readerListingAt = 0L
+    private var readerEntries: MutableList<JSONObject>? = null
+    private var readerEntriesAt = 0L
+    /** A position moved on the reader since the listing was read. */
+    private var readerPositionsStale = false
+    /** Until then, a new library fingerprint is this app's own change coming back. */
+    private var libraryEchoUntil = 0L
     private var lastPositionSyncAt = 0L
     private var bookOpenDeferredAt = 0L
     private var lastBookOpenRetryAt = 0L
@@ -2392,6 +2710,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Statuses read after hello are trimmed and do not carry capabilities.
      */
     private var aboutFeatures: Set<String>? = null
+    /** This connection's `about` document; see [readAbout]. */
+    private var aboutDoc: JSONObject? = null
+    private val aboutLock = Mutex()
+    /** Outcomes from the last `progress_result` download; null when unknown. */
+    private var lastProgressResults: Map<String, String>? = null
+    /** Books sent before their cover was rendered; [warmCovers] sends their metadata. */
+    private val metaOwed = mutableSetOf<String>()
+    /** Covers being fetched, by filename, so a book is not fetched twice at once. */
+    private val coversWarming = mutableSetOf<String>()
     /**
      * Saves whose resume question is still unanswered. The mirror holds these
      * back: where the book opens is the user's answer, and it travels with the send.
@@ -2403,16 +2730,63 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val BOOK_POSITION = "book_position"
 
     private fun invalidateReaderListing() {
-        readerListing = null
+        readerEntries = null
     }
 
-    private suspend fun readerLibrary(): ByteArray? {
-        val cached = readerListing
-        if (cached != null && System.currentTimeMillis() - readerListingAt < LISTING_TTL_MS) return cached
-        val fresh = runCatching { ble.download("library") }.getOrNull() ?: return null
-        readerListing = fresh
-        readerListingAt = System.currentTimeMillis()
-        return fresh
+    /**
+     * The reader's listing entries, copies. Kept when [forPositions] is false and
+     * a listing is held; with [forPositions] also its positions must be current.
+     * Null when the listing cannot be read or parsed -- never "the reader is empty".
+     */
+    private suspend fun readerLibrary(forPositions: Boolean): List<JSONObject>? {
+        readerEntries?.let { kept ->
+            val positionsCurrent = !readerPositionsStale &&
+                System.currentTimeMillis() - readerEntriesAt < LISTING_POSITIONS_TTL_MS
+            if (!forPositions || positionsCurrent) return kept.map { JSONObject(it.toString()) }
+        }
+        val bytes = runCatching {
+            traced<ByteArray>("library", bytes = { it.size.toLong() }) { ble.download("library") }
+        }.getOrNull() ?: return null
+        // A BARE ARRAY of book objects -- BookLibraryIndex writes "[", the entries,
+        // then "]". A parse failure is null and stops the caller.
+        val parsed = runCatching {
+            val arr = JSONArray(String(bytes, Charsets.UTF_8))
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        }.getOrNull() ?: return null
+        readerEntries = parsed.map { JSONObject(it.toString()) }.toMutableList()
+        readerEntriesAt = System.currentTimeMillis()
+        readerPositionsStale = false
+        return parsed
+    }
+
+    /** A book this app just put on the reader. A replace keeps its entry, and its position. */
+    private fun listingAdd(filename: String) {
+        libraryEchoUntil = System.currentTimeMillis() + LIBRARY_ECHO_MS
+        val entries = readerEntries ?: return
+        if (entries.none { it.optString("filename") == filename }) {
+            entries += JSONObject().put("filename", filename).put("fromApp", true)
+        }
+    }
+
+    /** A book this app just removed from the reader. */
+    private fun listingRemove(filename: String) {
+        libraryEchoUntil = System.currentTimeMillis() + LIBRARY_ECHO_MS
+        readerEntries?.removeAll { it.optString("filename") == filename }
+    }
+
+    /** A position the reader reported applied. */
+    private fun listingSetPosition(filename: String, stamp: Long, percentage: Float) {
+        readerEntries?.firstOrNull { it.optString("filename") == filename }?.let {
+            it.put("timestamp", stamp)
+            it.put("percent", percentage.toDouble())
+        }
+    }
+
+    /** A heartbeat position that is not the kept listing's makes its positions stale. */
+    private fun noteHeartbeatForListing(filename: String, pct: Float) {
+        val entry = readerEntries?.firstOrNull { it.optString("filename") == filename } ?: return
+        val listed = entry.optDouble("percent", -1.0)
+        if (listed < 0.0 || kotlin.math.abs(listed - pct) > 0.0002) readerPositionsStale = true
     }
 
     private val LISTING_TTL_MS = 30_000L
@@ -2448,14 +2822,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun pruneDeviceBooks(): Int = pruneLock.withLock { pruneDeviceBooksLocked() }
 
     private suspend fun pruneDeviceBooksLocked(): Int {
-        val listing = readerLibrary() ?: return 0
-        // A BARE ARRAY of book objects -- BookLibraryIndex writes "[", the entries,
-        // then "]". A parse failure is null and stops here: it must never read as
-        // "the reader is empty".
-        val onDevice = runCatching {
-            val arr = JSONArray(String(listing, Charsets.UTF_8))
-            (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("filename")?.ifBlank { null } }
-        }.getOrNull() ?: return 0
+        // A listing that cannot be read or parsed is null and stops here: it must
+        // never read as "the reader is empty".
+        val listing = readerLibrary(forPositions = false) ?: return 0
+        val onDevice = listing.mapNotNull { it.optString("filename").ifBlank { null } }
         // The live reader's id only. deviceKey() falls back to the stored pairing and
         // then to "unknown"; a record filed under either says nothing about THIS reader.
         val readerId = _state.value.device?.deviceId ?: return 0
@@ -2464,7 +2834,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val gone = mutableSetOf<String>()
         for (filename in onDevice.filter { it in owed }) {
             if (!_state.value.connected || !_state.value.authorized) break
-            if (runCatching { ble.deleteBook(filename) }.getOrDefault(false).also { invalidateReaderListing() }) {
+            val deleted = runCatching {
+                traced<Boolean>("delete", note = { if (it) "ok" else "refused" }) { ble.deleteBook(filename) }
+            }.getOrDefault(false)
+            // No answer may still have deleted it: only a confirmed removal is kept locally.
+            if (deleted) listingRemove(filename) else invalidateReaderListing()
+            if (deleted) {
                 gone += filename
                 // Confirmed gone from the reader, so the local copy kept only to draw
                 // the pending row can go too. Only now does the row leave the Library.
@@ -2538,10 +2913,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Best-effort: a book with no cover, or a reader that does not accept the
      * kind, still transfers normally. A missing sidecar costs a thumbnail.
      */
-    private suspend fun sendBookMetadata(book: Book) {
+    private suspend fun sendBookMetadata(book: Book, coverFetched: Boolean = false) {
         val kinds = _state.value.device?.uploadKinds.orEmpty()
         if (kinds.isNotEmpty() && "book_meta" !in kinds) return
         val c = _state.value.config
+        if (coverFetched) {
+            // Sent once, by whichever of the warm and the send gets here first.
+            if (!metaOwed.remove(book.filename)) return
+        } else if (book.coverUrl != null && c.serverConfigured &&
+            !covers.hasDeviceThumb(book.coverUrl, DeviceThumb.ROW_WIDTH, DeviceThumb.ROW_HEIGHT)
+        ) {
+            // Never waits on Calibre for a cover: the book goes first, and this
+            // follows as soon as the cover has been fetched.
+            metaOwed += book.filename
+            warmCovers(listOf(book))
+            return
+        }
         val thumb = runCatching {
             covers.deviceThumbnail(
                 book.coverUrl, c.username, c.password,
@@ -2568,7 +2955,53 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
         // req 0: this is not an answer to anything the reader asked for.
         val blob = CatalogContainer.detail(0, book.id, item, 1024)
-        runCatching { ble.uploadBytes(data = blob, kind = "book_meta") }
+        runCatching {
+            traced<BleClient.UploadResult>("book_meta", bytes = { it.bytes }) {
+                ble.uploadBytes(data = blob, kind = "book_meta")
+            }
+        }
+    }
+
+    /**
+     * Renders the reader's row covers for [shelf] from Calibre, beside the sync.
+     * A book that was sent before its cover was ready gets its metadata as soon
+     * as the cover is in.
+     */
+    private fun warmCovers(shelf: List<Book>) {
+        val c = _state.value.config
+        if (!c.serverConfigured) return
+        val missing = shelf.filter {
+            it.coverUrl != null && it.filename !in coversWarming &&
+                !covers.hasDeviceThumb(it.coverUrl, DeviceThumb.ROW_WIDTH, DeviceThumb.ROW_HEIGHT)
+        }
+        if (missing.isEmpty()) return
+        coversWarming += missing.map { it.filename }
+        val job = viewModelScope.launch {
+            try {
+                traced<Int>("covers", note = { "$it of ${missing.size} fetched" }) {
+                    coroutineScope {
+                        missing.map { b ->
+                            async {
+                                runCatching {
+                                    covers.deviceThumbnail(
+                                        b.coverUrl, c.username, c.password,
+                                        DeviceThumb.ROW_WIDTH, DeviceThumb.ROW_HEIGHT,
+                                    )
+                                }.getOrNull()
+                            }
+                        }.awaitAll().count { it != null }
+                    }
+                }
+            } finally {
+                coversWarming -= missing.map { it.filename }.toSet()
+            }
+            for (b in missing) {
+                if (b.filename in metaOwed && _state.value.connected && _state.value.authorized) {
+                    sendBookMetadata(b, coverFetched = true)
+                }
+            }
+        }
+        trackWork(job)
     }
 
     private fun markBusy(id: String, busy: Boolean) {
@@ -2735,7 +3168,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val linked = _state.value.connected && _state.value.authorized
         val onReader = if (linked) {
             runCatching { ble.deleteBook(row.book.filename, closeIfOpen = openOnReader) }
-                .getOrDefault(false).also { invalidateReaderListing() }
+                .getOrDefault(false).also { removed ->
+                    if (removed) listingRemove(row.book.filename) else invalidateReaderListing()
+                }
         } else {
             null
         }
@@ -2853,6 +3288,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         // Timestamp of a position sent with the book; 0 when none was.
         var positionStamp = 0L
+        var replacing = false
         val outcome = runCatching {
             // The local copy doubles as the offline library and as the source
             // for handing the book to KOReader, so it is kept, not deleted.
@@ -2870,7 +3306,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 transfer = TransferProgress("Transferring: ${row.book.title}", 0, target.length())
             )
             var lastShown = 0L
-            val replacing = row.book.filename in replaceOnSend.load(deviceKey())
+            replacing = row.book.filename in replaceOnSend.load(deviceKey())
             // An owed resume rides with the book where the reader can take it, so
             // the very first open lands on it. Not on a replace: the reader may
             // hold real reading there, and the position sync's 2% rule decides.
@@ -2890,21 +3326,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             positionStamp = if (owedHere != null) System.currentTimeMillis() / 1000 else 0L
+            val traceName = "book " + row.book.title.take(24)
             try {
-                ble.upload(
-                    target,
-                    row.book.filename,
-                    replace = replacing,
-                    position = owedHere?.positionJson(positionStamp),
-                    onProgress = onProgress,
-                )
+                traced<BleClient.UploadResult>(
+                    traceName,
+                    bytes = { it.bytes },
+                    note = { if (it.positionApplied) "with position" else "" },
+                ) {
+                    ble.upload(
+                        target,
+                        row.book.filename,
+                        replace = replacing,
+                        position = owedHere?.positionJson(positionStamp),
+                        onProgress = onProgress,
+                    )
+                }
             } catch (e: BleClient.BleException) {
                 // The reader refuses the whole send over a position it cannot take.
                 // The book matters more: send it bare, and the position sync delivers.
                 if (positionStamp == 0L || e.code != "invalid position") throw e
                 positionStamp = 0L
                 lastShown = 0L
-                ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
+                traced<BleClient.UploadResult>(traceName, bytes = { it.bytes }) {
+                    ble.upload(target, row.book.filename, replace = replacing, onProgress = onProgress)
+                }
             }
         }
 
@@ -2913,7 +3358,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             onSuccess = { r ->
                 sentBooks.add(deviceId, row.book.filename)
                 replaceOnSend.forget(deviceId, row.book.filename)
-                invalidateReaderListing()
+                listingAdd(row.book.filename)
                 bookOpenDeferredAt = 0L
                 // Applied with the book: no longer owed. Otherwise the position
                 // sync that follows the send delivers it.
@@ -2963,6 +3408,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // a mirror -- reloading the catalogue over the user's search, and
         // re-reading the whole shelf's progress from kosync each time.
         restampRows()
+
+        val sent = outcome.getOrNull() ?: return@launch
+        // Cover and blurb held back for a cover that is in now.
+        if (row.book.filename in metaOwed &&
+            covers.hasDeviceThumb(row.book.coverUrl, DeviceThumb.ROW_WIDTH, DeviceThumb.ROW_HEIGHT)
+        ) {
+            sendBookMetadata(row.book, coverFetched = true)
+        }
+        // A resume the user chose, straight after its book and before any network work.
+        if (!replacing && !(positionStamp > 0L && sent.positionApplied)) {
+            deliverOwedResumeNow(row.book.filename)
+        }
     }
 
     /**
@@ -3009,7 +3466,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val elapsed = System.currentTimeMillis() - firstByteAt
                     val kbps = if (elapsed > 0) (sent * 1000 / elapsed / 1024).toInt() else 0
                     _state.value = _state.value.copy(
-                        transfer = TransferProgress(displayName, sent, total),
+                        transfer = TransferProgress(displayName, sent, total, kbps),
                         firmwareProgress = _state.value.firmwareProgress?.let { p ->
                             if (total > 0) p.copy(percent = (sent * 100 / total).toInt(), kbps = kbps) else p
                         },
@@ -3067,17 +3524,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * cannot say its version (the install still works -- the upload path is
      * older than the version report).
      */
-    fun checkFirmware(readReader: Boolean = true) = viewModelScope.launch {
+    fun checkFirmware(readReader: Boolean = true, freshAbout: Boolean = true) = viewModelScope.launch {
         val base = _state.value.config.effectiveUpdatesUrl.trimEnd('/')
         _state.value = _state.value.copy(firmwareChecking = true)
         // No update page set: nothing to fetch. The reader half still runs.
         val manifest = if (base.isBlank()) null
-        else async(Dispatchers.IO) { runCatching { fetchManifest(base) } }
+        else async {
+            runCatching {
+                traced<FirmwareManifest>("firmware page") { withContext(Dispatchers.IO) { fetchManifest(base) } }
+            }
+        }
         val linked = _state.value.connected && _state.value.authorized
-        val about = if (linked && readReader) {
-            runCatching { org.json.JSONObject(String(ble.download("about"), Charsets.UTF_8)) }
-        } else null
-        about?.getOrNull()?.let { rememberAboutFeatures(it) }
+        val about = if (linked && readReader) readAbout(fresh = freshAbout) else null
         // Firmware from before the `about` download refuses the kind outright, and
         // that is itself an answer: the version report shipped with the update
         // page, so a reader that cannot give one is older than anything on it. Any
@@ -3223,7 +3681,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!_state.value.config.autoDownloadFirmware &&
             System.currentTimeMillis() - lastFirmwareCheckAt < FIRMWARE_CHECK_MS
         ) return
-        checkFirmware()
+        // The session's first `about` read; the first send shares it.
+        trackWork(checkFirmware(freshAbout = false))
     }
 
     /**
@@ -3462,7 +3921,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         setDeviceSettings(ui.copy(loading = true, loadError = null, notice = null))
         runCatching {
-            val bytes = ble.download("settings")
+            val bytes = traced<ByteArray>("settings", bytes = { it.size.toLong() }) { ble.download("settings") }
             org.json.JSONObject(String(bytes, Charsets.UTF_8).trim())
         }.fold(
             onSuccess = { doc ->
@@ -3616,8 +4075,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** When the catalogue last loaded; drives [refreshCatalogueIfStale]. */
     private var lastCatalogueAt = 0L
-    /** True while a sync pass is awaiting refresh() -- see refresh()'s requestSync. */
-    private var catalogueJoining = false
 
     /**
      * Keeps the phone current with Calibre WITHOUT holding up the reader.
@@ -3627,7 +4084,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun refreshCatalogueIfStale() {
         if (!_state.value.config.serverConfigured) return
-        if (System.currentTimeMillis() - lastCatalogueAt >= CATALOGUE_STALE_MS) refresh()
+        if (System.currentTimeMillis() - lastCatalogueAt >= CATALOGUE_STALE_MS) trackWork(refresh())
     }
 
     private fun reauthenticate() {
@@ -3718,6 +4175,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** True while stopping the background service would cut something off. */
     fun hasBackgroundWork(): Boolean =
         syncJob?.isActive == true || heartbeatWriting || heartbeatPending.isNotEmpty() ||
+            kosyncJob?.isActive == true || calibreJob?.isActive == true ||
             _state.value.transfer != null ||
             // The reader reboots mid-install; the watch must outlive the dropped link.
             _state.value.firmwareProgress?.phase == FirmwarePhase.INSTALLING

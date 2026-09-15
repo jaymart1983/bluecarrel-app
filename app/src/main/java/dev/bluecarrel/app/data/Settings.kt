@@ -367,7 +367,7 @@ data class OwedResume(
  * its timestamp is newer than its own save -- so a book opened once before the
  * position lands keeps page one forever. The choice is recorded here and
  * delivered by the position sync until the reader confirms it. See
- * MainViewModel.syncProgressToKosync.
+ * MainViewModel.runKosyncPass.
  *
  * Keyed per reader, like [StartFreshStore], and persisted because delivery can
  * wait for the book to be closed, a reconnect, or an app restart.
