@@ -63,6 +63,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
@@ -129,10 +130,36 @@ class BleClient(private val context: Context) {
          * Over GATT this is what stops the reader's event queue overflowing, so
          * it has to be small and every boundary costs a round trip. On the
          * channel the reader's credits pace us frame by frame, so this is only
-         * how often it reports progress — and the reader allows up to 256 KB
-         * for an l2cap transfer precisely so those round trips nearly vanish.
+         * how often it reports progress — and its report is the only truthful
+         * account of where the book has got to.
+         *
+         * It was 256 KB, which at the 45 KB/s the channel now measures meant the
+         * truth arrived every 5.7 s: a bar that sat still for seconds at a time.
+         * 32 KB is about 0.7 s. The reader takes 20 B to 256 KB on an l2cap
+         * transfer (BLE_UPLOAD_ACK_BYTES_MIN, BLE_UPLOAD_ACK_BYTES_MAX_L2CAP in
+         * its BleLink.cpp), so this is well inside what it will accept.
          */
-        const val L2CAP_ACK_BYTES = 256 * 1024
+        const val L2CAP_ACK_BYTES = 32 * 1024
+
+        /**
+         * How far ahead of the reader a channel upload may get before it waits,
+         * which is deliberately NOT how often the reader reports.
+         *
+         * Asking for a report every 32 KB is free; *blocking* every 32 KB is
+         * not. A reader that fell behind would turn each boundary into a round
+         * trip with the socket buffer drained and nothing in flight, which is
+         * exactly the throughput the channel was worth doing for. So the wait
+         * stays on the 256 KB boundary it was on when a book measured 45 KB/s,
+         * and only the reporting got finer.
+         */
+        const val L2CAP_CREDIT_BYTES = 256 * 1024
+
+        /**
+         * How often an upload's bar is refreshed when no status has arrived.
+         * A report wakes it sooner; this is only so the bytes-written floor
+         * animates for a book too small to earn one.
+         */
+        private const val PROGRESS_TICK_MS = 100L
 
         /** How long createL2capChannel and its connect() get before it is given up on. */
         private const val L2CAP_CONNECT_TIMEOUT_MS = 5_000L
@@ -1810,6 +1837,10 @@ class BleClient(private val context: Context) {
         // payload and the frame header eats 4 more.
         val chunk = if (useL2cap) l2capChunk else minOf(MAX_CHUNK_BYTES, maxOf(1, mtu - 3 - FRAME_HEADER_BYTES))
         val ackBytes = if (useL2cap) L2CAP_ACK_BYTES else ACK_BYTES
+        // How often the reader *reports* is not how often we must *stop*: over
+        // GATT they are the same number and always were, on the channel they
+        // are not. See [L2CAP_CREDIT_BYTES].
+        val creditBytes = if (useL2cap) L2CAP_CREDIT_BYTES else ACK_BYTES
         val started = System.currentTimeMillis()
 
         val startPut = JSONObject()
@@ -1855,54 +1886,83 @@ class BleClient(private val context: Context) {
             val out = if (useL2cap) l2capOut else null
             if (useL2cap && out == null) throw L2capFallback("the channel closed")
 
-            open().use { input ->
-                while (sent < total) {
-                    // Must be a *full* read: the reader was told chunk_size in
-                    // start_put and treats a short frame as a protocol error,
-                    // and InputStream.read is allowed to return fewer bytes
-                    // than asked for even mid-file.
-                    val n = input.readFully(buffer)
-                    if (n <= 0) break
-                    val frame = ByteArray(FRAME_HEADER_BYTES + n)
-                    ByteBuffer.wrap(frame, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
-                        .putInt(sequence.toInt())
-                    System.arraycopy(buffer, 0, frame, FRAME_HEADER_BYTES, n)
-                    val w = System.nanoTime()
-                    if (out != null) {
-                        // The blocking write IS the flow control. The reader
-                        // returns a credit only once the main loop has taken the
-                        // last SDU, so this blocks exactly as a TCP send does and
-                        // there is nothing to await per frame.
-                        withContext(Dispatchers.IO) { out.write(frame) }
-                    } else {
-                        writeChar(dataInChar, frame, withoutResponse = true)
-                    }
-                    writeNs += System.nanoTime() - w
-                    sequence += 1
-                    sent += n
-                    onProgress(sent, total)
+            // Written by the write loop, read by the reporter on this thread.
+            val written = AtomicLong(0)
 
-                    if (sent - lastCredit >= ackBytes) {
-                        lastCredit = sent
-                        val c = System.nanoTime()
-                        awaitReceived(lastCredit)
-                        val waited = System.nanoTime() - c
-                        creditNs += waited
-                        creditMaxNs = maxOf(creditMaxNs, waited)
-                        creditWaits++
-                        onProgress(sent, total)
+            coroutineScope {
+                // The only caller of onProgress while bytes are moving, and it
+                // runs here on the caller's dispatcher while the channel's write
+                // loop is away on Dispatchers.IO. That is the whole point: a
+                // socket write that blocks for seconds no longer takes the bar
+                // down with it, because the reader's status arrives on the GATT
+                // connection and is published from a Bluetooth thread
+                // ([dispatchNotification]), which the write never touches.
+                val reporter = launch {
+                    reportUploadProgress(written, total, ackBytes.toLong(), onProgress)
+                }
+                try {
+                    suspend fun writeFrames() {
+                        open().use { input ->
+                            while (sent < total) {
+                                // Must be a *full* read: the reader was told chunk_size in
+                                // start_put and treats a short frame as a protocol error,
+                                // and InputStream.read is allowed to return fewer bytes
+                                // than asked for even mid-file.
+                                val n = input.readFully(buffer)
+                                if (n <= 0) break
+                                val frame = ByteArray(FRAME_HEADER_BYTES + n)
+                                ByteBuffer.wrap(frame, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
+                                    .putInt(sequence.toInt())
+                                System.arraycopy(buffer, 0, frame, FRAME_HEADER_BYTES, n)
+                                val w = System.nanoTime()
+                                if (out != null) {
+                                    // The blocking write IS the flow control. The reader
+                                    // returns a credit only once the main loop has taken the
+                                    // last SDU, so this blocks exactly as a TCP send does and
+                                    // there is nothing to await per frame.
+                                    out.write(frame)
+                                } else {
+                                    writeChar(dataInChar, frame, withoutResponse = true)
+                                }
+                                writeNs += System.nanoTime() - w
+                                sequence += 1
+                                sent += n
+                                written.set(sent)
+
+                                if (sent - lastCredit >= creditBytes) {
+                                    lastCredit = sent
+                                    val c = System.nanoTime()
+                                    awaitReceived(lastCredit)
+                                    val waited = System.nanoTime() - c
+                                    creditNs += waited
+                                    creditMaxNs = maxOf(creditMaxNs, waited)
+                                    creditWaits++
+                                }
+                            }
+                        }
+                        if (out != null) out.flush()
                     }
+                    // One hop for the whole loop instead of one per frame. GATT
+                    // stays on the caller's dispatcher, where writeChar only ever
+                    // awaits a callback and never blocks a thread.
+                    if (out != null) withContext(Dispatchers.IO) { writeFrames() } else writeFrames()
+                    if (sent != total) throw BleException("Read $sent of $total bytes from local storage")
+
+                    // Inside the reporter's life on purpose: this wait is where the
+                    // reader takes the tail of the book off the channel, and the bar
+                    // should fill through it rather than stop at the last write.
+                    val c = System.nanoTime()
+                    awaitReceived(total)
+                    val waited = System.nanoTime() - c
+                    creditNs += waited
+                    creditMaxNs = maxOf(creditMaxNs, waited)
+                    creditWaits++
+                } finally {
+                    reporter.cancel()
                 }
             }
-            if (out != null) withContext(Dispatchers.IO) { out.flush() }
-            if (sent != total) throw BleException("Read $sent of $total bytes from local storage")
-
-            val c = System.nanoTime()
-            awaitReceived(total)
-            val waited = System.nanoTime() - c
-            creditNs += waited
-            creditMaxNs = maxOf(creditMaxNs, waited)
-            creditWaits++
+            // Every byte is on the reader: say so once, whatever the last tick saw.
+            onProgress(total, total)
 
             val k = System.nanoTime()
             val committed = commandAwait(
@@ -1997,6 +2057,49 @@ class BleClient(private val context: Context) {
             filled += n
         }
         return filled
+    }
+
+    /**
+     * Moves an upload's bar for as long as the bytes are in flight.
+     *
+     * The reader's `received` is the only truthful figure. On the channel a
+     * write returns the moment the phone's socket buffer has room and then
+     * blocks for as long as the buffer takes to drain, so bytes written arrive
+     * in bursts with long flat stretches between them — which is precisely the
+     * bar that "only updated every few seconds" while the book was still
+     * moving. Bytes written stand in only until the reader's first report, and
+     * only as far as [floorCap] (one reporting boundary), so a book too small
+     * to earn a report still animates without claiming ground the reader has
+     * not covered.
+     *
+     * Monotone and clamped to [total]: the two series cross, and a bar that
+     * retreats reads as a fault. Everything the screen shows comes from here,
+     * so the KB/s meter downstream is fed the same series as the bar.
+     */
+    private suspend fun reportUploadProgress(
+        written: AtomicLong,
+        total: Long,
+        floorCap: Long,
+        onProgress: (sent: Long, total: Long) -> Unit,
+    ) {
+        var shown = -1L
+        while (true) {
+            val s = _status.value
+            // "receiving" is this transfer: start_put has been acknowledged and
+            // the reader zeroes its count there, so no earlier one can leak in.
+            val reader = if (s?.state == "receiving") (s.received ?: 0L) else 0L
+            val floor = if (reader > 0L) 0L else minOf(written.get(), floorCap)
+            val next = maxOf(maxOf(reader, floor), maxOf(shown, 0L)).coerceAtMost(total)
+            if (next != shown) {
+                shown = next
+                onProgress(shown, total)
+            }
+            // A status wakes this at once; the tick is only for the floor, and
+            // ten a second is still under the gate the screen applies anyway.
+            withTimeoutOrNull(PROGRESS_TICK_MS) {
+                statusUpdates.first { it.state == "receiving" || it.state == "error" }
+            }
+        }
     }
 
     private suspend fun awaitReceived(target: Long) {
