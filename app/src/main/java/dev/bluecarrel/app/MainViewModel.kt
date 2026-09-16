@@ -602,7 +602,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 traceNote("link", text)
                 _state.value = _state.value.copy(
                     linkInfo = "mtu ${ble.negotiatedMtu}, phy ${ble.phy ?: "?"}, " +
-                        "priority ${if (ble.fastLink) "high" else "balanced"}",
+                        "priority ${if (ble.fastLink) "high" else "balanced"}, " +
+                        "l2cap ${if (ble.l2capOpen) "open" else "-"}",
                 )
             }
         }
@@ -1399,6 +1400,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (u != null) {
             fun ms(key: String) = SyncTrace.duration(u.optLong(key))
+            // The reader's own view of which transport carried it. Shown beside
+            // the app's so a disagreement is visible rather than guessed at.
+            u.optString("transport").ifBlank { null }?.let { parts += "transport $it" }
             if (u.has("min_msys_free")) parts += "msys min ${u.optInt("min_msys_free")}"
             if (u.has("min_acl_free")) parts += "acl min ${u.optInt("min_acl_free")}"
             if (u.has("max_queue")) parts += "queue ${u.optInt("max_queue")}"
@@ -2767,6 +2771,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             about.optInt("download_chunk_max", 0).takeIf { it > 0 },
             windowed = "download_window" in features,
         )
+        // The bulk channel, once per connection, as soon as `about` says the
+        // reader has one. Best effort: without it everything stays on GATT,
+        // which is what older firmware gets anyway.
+        val l2cap = about.optJSONObject("l2cap")
+        if (l2cap != null && "l2cap_coc" in features) {
+            val psm = l2cap.optInt("psm", 0)
+            val sdu = l2cap.optInt("mtu", 0)
+            if (psm > 0 && sdu > 0) viewModelScope.launch { ble.openL2cap(psm, sdu) }
+        }
     }
 
     /**

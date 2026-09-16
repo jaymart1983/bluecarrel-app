@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothSocket
 import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
@@ -48,11 +49,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.util.TimeZone
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
@@ -118,6 +122,26 @@ class BleClient(private val context: Context) {
 
         /** Credit window before we must wait for the reader to catch up. */
         const val ACK_BYTES = 24_000
+
+        /**
+         * The same window on the L2CAP channel, where it means something else.
+         *
+         * Over GATT this is what stops the reader's event queue overflowing, so
+         * it has to be small and every boundary costs a round trip. On the
+         * channel the reader's credits pace us frame by frame, so this is only
+         * how often it reports progress — and the reader allows up to 256 KB
+         * for an l2cap transfer precisely so those round trips nearly vanish.
+         */
+        const val L2CAP_ACK_BYTES = 256 * 1024
+
+        /** How long createL2capChannel and its connect() get before it is given up on. */
+        private const val L2CAP_CONNECT_TIMEOUT_MS = 5_000L
+
+        /** Upload kinds worth moving to the channel; small control documents stay on GATT. */
+        private val L2CAP_UPLOAD_KINDS = setOf("book", "bmp", "firmware", "progress", "book_meta")
+
+        /** Download kinds worth moving to the channel, for the same reason. */
+        private val L2CAP_DOWNLOAD_KINDS = setOf("book", "library")
 
         /**
          * The reference client's download chunk size, and the most older firmware
@@ -331,6 +355,29 @@ class BleClient(private val context: Context) {
 
     /** The device_id the verified hello was made with. A status naming another reader drops authorisation. */
     @Volatile private var authedDeviceId: String? = null
+
+    // --- L2CAP channel --------------------------------------------------------
+    // One channel per connection, opened after hello when the reader's `about`
+    // advertises it, and closed with the link or with the authorisation.
+
+    @Volatile private var l2capSocket: BluetoothSocket? = null
+    @Volatile private var l2capIn: InputStream? = null
+    @Volatile private var l2capOut: OutputStream? = null
+
+    /** Payload bytes per frame on the channel: one SDU less its 4-byte sequence. */
+    @Volatile private var l2capChunk: Int = 0
+
+    /**
+     * Opening the channel failed on THIS connection, so it is not tried again
+     * for it. Cleared by [teardown], which every new connection starts from.
+     */
+    @Volatile private var l2capRefused: Boolean = false
+
+    /** A channel is open and usable for bulk transfers. */
+    val l2capOpen: Boolean get() = l2capSocket != null
+
+    /** Thrown when an l2cap attempt failed before any byte reached the reader. */
+    private class L2capFallback(message: String) : Exception(message)
 
     /** Serializes GATT operations: the stack allows exactly one in flight. */
     private val opLock = Mutex()
@@ -620,6 +667,9 @@ class BleClient(private val context: Context) {
         mtuGate?.completeExceptionally(cause)
         ioGate?.completeExceptionally(cause)
         control = null; dataIn = null; statusChar = null; dataOut = null
+        closeL2cap()
+        // A fresh connection gets a fresh chance at the channel.
+        l2capRefused = false
         authorized = false
         authedDeviceId = null
         mtu = DEFAULT_MTU
@@ -1214,6 +1264,76 @@ class BleClient(private val context: Context) {
     fun markUnauthorized() {
         authorized = false
         authedDeviceId = null
+        // The channel belongs to the authenticated session: the reader closes it
+        // on its side the moment that ends, so this side lets go too.
+        closeL2cap()
+    }
+
+    /**
+     * Opens the reader's L2CAP channel, once per connection.
+     *
+     * [BluetoothDevice.createL2capChannel] is the SECURE variant deliberately:
+     * it requires the link to be encrypted, authenticated and bonded before the
+     * channel is offered, which is the same bar the reader's own accept gate
+     * applies. `createInsecureL2capChannel` would only get as far as the
+     * reader's refusal with "insufficient authentication".
+     *
+     * connect() blocks, so this runs on an IO thread under a timeout. A failure
+     * is remembered for this connection and every transfer stays on GATT.
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun openL2cap(psm: Int, sduBytes: Int): Boolean {
+        if (l2capSocket != null) return true
+        if (l2capRefused || !authorized) return false
+        if (psm !in 1..0xFFFF || sduBytes <= FRAME_HEADER_BYTES) return false
+        val device = gatt?.device ?: return false
+        if (device.bondState != BluetoothDevice.BOND_BONDED) return false
+        val opened = runCatching {
+            withTimeout(L2CAP_CONNECT_TIMEOUT_MS) {
+                withContext(Dispatchers.IO) {
+                    val socket = device.createL2capChannel(psm)
+                    runCatching { socket.connect() }.onFailure {
+                        runCatching { socket.close() }
+                        throw it
+                    }
+                    socket
+                }
+            }
+        }.getOrElse { e ->
+            if (e is CancellationException) throw e
+            l2capRefused = true
+            onLinkEvent?.invoke("l2cap psm $psm refused: ${e.message ?: e.javaClass.simpleName}")
+            return false
+        }
+        val input = runCatching { opened.inputStream }.getOrNull()
+        val output = runCatching { opened.outputStream }.getOrNull()
+        if (input == null || output == null) {
+            runCatching { opened.close() }
+            l2capRefused = true
+            return false
+        }
+        // A frame has to fit one SDU at both ends: the size the reader
+        // advertised, and what this phone's stack puts in a single write.
+        val phoneMax = runCatching { opened.maxTransmitPacketSize }.getOrDefault(0)
+        val cap = if (phoneMax > FRAME_HEADER_BYTES) minOf(sduBytes, phoneMax) else sduBytes
+        l2capChunk = (cap - FRAME_HEADER_BYTES).coerceIn(1, sduBytes - FRAME_HEADER_BYTES)
+        l2capSocket = opened
+        l2capIn = input
+        l2capOut = output
+        onLinkEvent?.invoke("l2cap open psm $psm, frame $l2capChunk B")
+        return true
+    }
+
+    fun closeL2cap() {
+        val socket = l2capSocket
+        l2capSocket = null
+        l2capIn = null
+        l2capOut = null
+        l2capChunk = 0
+        if (socket != null) {
+            runCatching { socket.close() }
+            onLinkEvent?.invoke("l2cap closed")
+        }
     }
 
     /**
@@ -1502,6 +1622,8 @@ class BleClient(private val context: Context) {
      */
     data class UploadTiming(
         val kind: String,
+        /** `l2cap` or `gatt`: which transport actually carried the frames. */
+        val transport: String,
         /** Wall clock at start_put. */
         val startedAt: Long,
         /** Bytes actually written, which is less than the file on a failure. */
@@ -1529,6 +1651,7 @@ class BleClient(private val context: Context) {
             append(" · mtu ").append(mtu)
             append(" · phy ").append(phy ?: "?")
             append(" · priority ").append(if (priorityHigh) "high" else "balanced")
+            append(" · transport ").append(transport)
             if (error != null) append(" · failed: ").append(error.take(60))
         }
     }
@@ -1645,14 +1768,48 @@ class BleClient(private val context: Context) {
         position: JSONObject? = null,
         calibreUuid: String? = null,
     ): UploadResult = transferLock.withLock {
+        val wantL2cap = l2capOpen && kind in L2CAP_UPLOAD_KINDS
+        try {
+            uploadAttempt(name, kind, req, total, sha, open, onProgress, commitDone, replace,
+                version, signature, position, calibreUuid, useL2cap = wantL2cap)
+        } catch (e: L2capFallback) {
+            // Once, and only because nothing had reached the reader yet: either it
+            // answered "no channel" or the socket failed before the first frame.
+            // Every later transfer on this connection goes straight to GATT.
+            closeL2cap()
+            l2capRefused = true
+            onLinkEvent?.invoke("l2cap upload fell back to gatt: ${e.message}")
+            uploadAttempt(name, kind, req, total, sha, open, onProgress, commitDone, replace,
+                version, signature, position, calibreUuid, useL2cap = false)
+        }
+    }
+
+    private suspend fun uploadAttempt(
+        name: String?,
+        kind: String,
+        req: Int?,
+        total: Long,
+        sha: String,
+        open: () -> java.io.InputStream,
+        onProgress: (sent: Long, total: Long) -> Unit,
+        commitDone: (DeviceStatus) -> Boolean,
+        replace: Boolean,
+        version: String?,
+        signature: String?,
+        position: JSONObject?,
+        calibreUuid: String?,
+        useL2cap: Boolean,
+    ): UploadResult {
         if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         val dataInChar = dataIn ?: throw BleException("Not connected")
         if (name != null && !isSafeTransferName(name)) {
             throw BleException("\"$name\" is not a name the reader will accept")
         }
 
-        // mtu - 3 is the ATT payload; the frame header eats 4 more.
-        val chunk = minOf(MAX_CHUNK_BYTES, maxOf(1, mtu - 3 - FRAME_HEADER_BYTES))
+        // On the channel a frame is one whole SDU. Over GATT, mtu - 3 is the ATT
+        // payload and the frame header eats 4 more.
+        val chunk = if (useL2cap) l2capChunk else minOf(MAX_CHUNK_BYTES, maxOf(1, mtu - 3 - FRAME_HEADER_BYTES))
+        val ackBytes = if (useL2cap) L2CAP_ACK_BYTES else ACK_BYTES
         val started = System.currentTimeMillis()
 
         val startPut = JSONObject()
@@ -1662,7 +1819,9 @@ class BleClient(private val context: Context) {
             .put("sha256", sha)
             .put("resume", false)
             .put("chunk_size", chunk)
-            .put("ack_bytes", ACK_BYTES)
+            .put("ack_bytes", ackBytes)
+        // Absent means GATT, which is the only thing older readers understand.
+        if (useL2cap) startPut.put("transport", "l2cap")
         if (name != null) startPut.put("name", name)
         if (req != null) startPut.put("req", req)
         // Omitted rather than false when not replacing, so older firmware sees
@@ -1693,6 +1852,8 @@ class BleClient(private val context: Context) {
 
             var lastCredit = 0L
             val buffer = ByteArray(chunk)
+            val out = if (useL2cap) l2capOut else null
+            if (useL2cap && out == null) throw L2capFallback("the channel closed")
 
             open().use { input ->
                 while (sent < total) {
@@ -1707,13 +1868,21 @@ class BleClient(private val context: Context) {
                         .putInt(sequence.toInt())
                     System.arraycopy(buffer, 0, frame, FRAME_HEADER_BYTES, n)
                     val w = System.nanoTime()
-                    writeChar(dataInChar, frame, withoutResponse = true)
+                    if (out != null) {
+                        // The blocking write IS the flow control. The reader
+                        // returns a credit only once the main loop has taken the
+                        // last SDU, so this blocks exactly as a TCP send does and
+                        // there is nothing to await per frame.
+                        withContext(Dispatchers.IO) { out.write(frame) }
+                    } else {
+                        writeChar(dataInChar, frame, withoutResponse = true)
+                    }
                     writeNs += System.nanoTime() - w
                     sequence += 1
                     sent += n
                     onProgress(sent, total)
 
-                    if (sent - lastCredit >= ACK_BYTES) {
+                    if (sent - lastCredit >= ackBytes) {
                         lastCredit = sent
                         val c = System.nanoTime()
                         awaitReceived(lastCredit)
@@ -1725,6 +1894,7 @@ class BleClient(private val context: Context) {
                     }
                 }
             }
+            if (out != null) withContext(Dispatchers.IO) { out.flush() }
             if (sent != total) throw BleException("Read $sent of $total bytes from local storage")
 
             val c = System.nanoTime()
@@ -1753,11 +1923,20 @@ class BleClient(private val context: Context) {
             // Best effort: if the link is already gone this just fails again,
             // and the reader drops its own partial ".ble-" staging file.
             runCatching { writeControl(JSONObject().put("op", "cancel")) }
+            // Nothing has reached the reader yet, so GATT can still carry this
+            // upload. Once a byte has gone the send fails for real: the reader
+            // holds a half-written part file and the next sync starts over.
+            if (useL2cap && sent == 0L && e !is CancellationException &&
+                (e is java.io.IOException || (e as? BleException)?.code == "no channel")
+            ) {
+                throw L2capFallback(e.message ?: "the channel would not carry it")
+            }
             throw e
         } finally {
             releaseFastLink()
             val timing = UploadTiming(
                 kind = kind,
+                transport = if (useL2cap) "l2cap" else "gatt",
                 startedAt = started,
                 bytes = sent,
                 totalMs = (System.nanoTime() - t0) / 1_000_000,
@@ -1858,6 +2037,25 @@ class BleClient(private val context: Context) {
         maxBytes: Long = Long.MAX_VALUE,
         onProgress: (received: Long, total: Long) -> Unit = { _, _ -> },
     ): ByteArray = transferLock.withLock {
+        val wantL2cap = l2capOpen && kind in L2CAP_DOWNLOAD_KINDS
+        try {
+            downloadAttempt(kind, fields, into, maxBytes, onProgress, useL2cap = wantL2cap)
+        } catch (e: L2capFallback) {
+            closeL2cap()
+            l2capRefused = true
+            onLinkEvent?.invoke("l2cap download fell back to gatt: ${e.message}")
+            downloadAttempt(kind, fields, into, maxBytes, onProgress, useL2cap = false)
+        }
+    }
+
+    private suspend fun downloadAttempt(
+        kind: String,
+        fields: Map<String, Any>,
+        into: java.io.OutputStream?,
+        maxBytes: Long,
+        onProgress: (received: Long, total: Long) -> Unit,
+        useL2cap: Boolean,
+    ): ByteArray {
         if (!authorized) throw BleException("Not authorised", reason = Reason.AUTH)
         (fields["name"] as? String)?.let { name ->
             if (!isSafeTransferName(name)) throw BleException(friendlyError("unsafe book filename"), "unsafe book filename")
@@ -1869,17 +2067,24 @@ class BleClient(private val context: Context) {
         // Above 160 only for a reader that advertised a maximum: older firmware
         // refuses the whole start_get. A frame must still fit one notification.
         val fit = downloadChunkMax?.let { minOf(it, mtu - 3 - FRAME_HEADER_BYTES) } ?: 0
-        val chunk = if (fit > DOWNLOAD_CHUNK_BYTES) fit else DOWNLOAD_CHUNK_BYTES
-        val window = if (downloadWindowed) DOWNLOAD_WINDOW else 1
-        lastDownloadShape = "chunk $chunk, window $window"
+        val gattChunk = if (fit > DOWNLOAD_CHUNK_BYTES) fit else DOWNLOAD_CHUNK_BYTES
+        // On the channel a frame is one whole SDU, so it is bounded by the SDU
+        // size rather than by the MTU, and the credits replace the ack window.
+        val chunk = if (useL2cap) l2capChunk else gattChunk
+        val window = if (useL2cap) 0 else if (downloadWindowed) DOWNLOAD_WINDOW else 1
+        lastDownloadShape = if (useL2cap) "l2cap, frame $chunk" else "gatt, chunk $chunk, window $window"
 
         val start = JSONObject()
             .put("op", "start_get")
             .put("kind", kind)
             .put("chunk_size", chunk)
+        // Absent means GATT, which is the only thing older readers understand.
+        if (useL2cap) start.put("transport", "l2cap")
         // Omitted, not 1, so a reader without windows sees the request it always has.
         if (window > 1) start.put("window", window)
         for ((k, v) in fields) start.put(k, v)
+
+        if (useL2cap) return downloadOverL2cap(start, into, chunk, maxBytes, onProgress)
 
         holdFastLink()
         try {
@@ -1978,6 +2183,84 @@ class BleClient(private val context: Context) {
             releaseFastLink()
         }
 
+        val out = ByteArray(received.toInt())
+        var offset = 0
+        for (c in chunks) {
+            System.arraycopy(c, 0, out, offset, c.size)
+            offset += c.size
+        }
+        return out
+    }
+
+    /**
+     * A download over the channel: `start_get` with `"transport":"l2cap"`, then
+     * one SDU per frame read straight off the socket.
+     *
+     * There is no `get_ack` here. The channel's credits are the flow control,
+     * and the reader counts a frame delivered once its stack has taken it, so
+     * the round trip per window that GATT needs simply is not in this path.
+     *
+     * Frames must still arrive in sequence. A gap means the stack coalesced or
+     * dropped an SDU — neither is something to carry on through, and because
+     * nothing has been written yet it falls back to GATT rather than failing.
+     */
+    private suspend fun downloadOverL2cap(
+        start: JSONObject,
+        into: java.io.OutputStream?,
+        chunk: Int,
+        maxBytes: Long,
+        onProgress: (received: Long, total: Long) -> Unit,
+    ): ByteArray {
+        val input = l2capIn ?: throw L2capFallback("the channel closed")
+        val chunks = mutableListOf<ByteArray>()
+        var received = 0L
+        holdFastLink()
+        try {
+            val ready = commandAwait(start, 15_000) { it.state == "sending" || it.state == "error" }
+            failIfError(ready)
+            // A tight notification can shed `size`; the read always has it.
+            val size = ready.size ?: runCatching { readStatus() }.getOrNull()?.size
+                ?: throw L2capFallback("the reader did not say how big it is")
+            if (size > maxBytes) throw BleException("The file is too large", "transfer too large")
+
+            withContext(Dispatchers.IO) {
+                val buffer = ByteArray(chunk + FRAME_HEADER_BYTES)
+                var expected = 0L
+                while (received < size) {
+                    val n = input.read(buffer)
+                    if (n < 0) throw BleException("The reader's channel closed mid-download")
+                    if (n < FRAME_HEADER_BYTES) throw BleException("Short frame on the channel ($n bytes)")
+                    val seq = ByteBuffer.wrap(buffer, 0, 4).order(ByteOrder.LITTLE_ENDIAN)
+                        .int.toLong() and 0xFFFFFFFFL
+                    if (seq != expected) {
+                        throw BleException("Out-of-order frame: got $seq, expected $expected")
+                    }
+                    val payload = n - FRAME_HEADER_BYTES
+                    received += payload
+                    if (received > maxBytes) throw BleException("The file is too large", "transfer too large")
+                    if (into != null) into.write(buffer, FRAME_HEADER_BYTES, payload)
+                    else chunks += buffer.copyOfRange(FRAME_HEADER_BYTES, n)
+                    expected += 1
+                    onProgress(received, size)
+                }
+            }
+            // Every byte is in hand; `sent` follows the last frame. Waited for
+            // briefly so a reader error still surfaces, never depended on.
+            withTimeoutOrNull(SENT_GRACE_MS) {
+                _status.filterNotNull().first { it.state == "sent" || it.state == "error" }
+            }?.let { failIfError(it) }
+        } catch (e: Throwable) {
+            if (e !is CancellationException) runCatching { writeControl(JSONObject().put("op", "cancel")) }
+            // Nothing written yet, so GATT can still do this download.
+            if (received == 0L && e !is CancellationException && e !is L2capFallback) {
+                throw L2capFallback(e.message ?: "the channel would not carry it")
+            }
+            throw e
+        } finally {
+            releaseFastLink()
+        }
+        // Callers that pass `into` have the bytes already and ignore this.
+        if (into != null) return ByteArray(0)
         val out = ByteArray(received.toInt())
         var offset = 0
         for (c in chunks) {
