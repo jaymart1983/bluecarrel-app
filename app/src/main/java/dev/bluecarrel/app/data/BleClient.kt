@@ -380,8 +380,19 @@ class BleClient(private val context: Context) {
     var lastDownloadShape: String = ""
         private set
 
-    /** The device_id the verified hello was made with. A status naming another reader drops authorisation. */
-    @Volatile private var authedDeviceId: String? = null
+    /**
+     * The device_id the verified hello was made with. A status naming another
+     * reader drops authorisation.
+     *
+     * Readable from outside because it is the one identity that is both current
+     * and proven: it comes from the fresh GATT read [authenticateLocked] makes
+     * (never a notification, which sheds `device_id`), and it is cleared by
+     * [teardown], by [markUnauthorized], and at the start of every authentication
+     * -- so it is null exactly when this link cannot name its reader.
+     */
+    @Volatile
+    var authedDeviceId: String? = null
+        private set
 
     // --- L2CAP channel --------------------------------------------------------
     // One channel per connection, opened after hello when the reader's `about`

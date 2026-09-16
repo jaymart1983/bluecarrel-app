@@ -425,6 +425,43 @@ data class DeviceStatus(
     /** The reader named a trusted host. Not proof of authentication on its own. */
     val trustedHost: Boolean get() = !trustedHostName.isNullOrBlank()
 
+    /**
+     * This status, with the identity a trimmed notification shed carried over
+     * from [previous] -- the last status of the SAME link.
+     *
+     * The firmware writes `device_id` only for a GATT READ (BleLink's
+     * buildStatusJson, `if (full)`): a notification is capped at ATT_MTU-3 and
+     * sheds everything the client can re-read. So the read taken while
+     * connecting put the reader's id in hand for a moment, and the very next
+     * notification -- a page turn, a sleep, a transfer tick -- took it away
+     * again, leaving every per-reader record keyed on nothing.
+     *
+     * Only what a status for this link actually reported is carried; nothing is
+     * invented. [raw] deliberately stays the text that really arrived, so
+     * Diagnostics shows the wire document rather than a merged one.
+     */
+    fun carryIdentityFrom(previous: DeviceStatus?): DeviceStatus =
+        // CARRIED: device_id. It is constant for the life of the reader, so the
+        // last status's answer is still this one's -- and it is the key every
+        // per-reader record is filed under.
+        //
+        // NOT CARRIED, deliberately: device_nonce, the only other READ-only
+        // field. The reader rotates it on every accepted hello, so a kept one is
+        // stale by definition -- BleClient re-reads the characteristic for each
+        // authentication rather than trust a cached status, and a stale nonce
+        // here could only mislead a reader of this field.
+        if (previous == null || deviceId != null) this else copy(deviceId = previous.deviceId)
+
+    /**
+     * This status with the carried identity dropped.
+     *
+     * A link that has gone, and one a different reader has just authorised, must
+     * each establish their own: lending the last reader's id to the first
+     * trimmed notification of the next connection would file one reader's books
+     * under another reader's name.
+     */
+    fun forgetIdentity(): DeviceStatus = copy(deviceId = null)
+
     companion object {
         fun parse(json: String): DeviceStatus? = runCatching {
             val j = JSONObject(json)

@@ -661,6 +661,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = s.copy(
                     connection = c,
                     authorized = if (c == BleConnection.CONNECTED) s.authorized else false,
+                    // The identity carried across trimmed notifications belongs to
+                    // the link that reported it. A link that has dropped must not
+                    // lend its reader's id to whatever connects next.
+                    device = if (c == BleConnection.CONNECTED) s.device else s.device?.forgetIdentity(),
                     storeActivity = if (c == BleConnection.CONNECTED) s.storeActivity else null,
                     readerOpenBook = if (c == BleConnection.CONNECTED) s.readerOpenBook else null,
                     link = when (c) {
@@ -699,7 +703,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             ble.status.filterNotNull().collect { s ->
                 _state.value = _state.value.copy(
-                    device = s,
+                    // NOT `s` on its own. A trimmed notification carries no
+                    // `device_id` -- the firmware writes it for a GATT read only --
+                    // so replacing the whole status with one threw the reader's
+                    // identity away moments after connecting, and every per-reader
+                    // record (the owed removals among them) lost its key with it.
+                    device = s.carryIdentityFrom(_state.value.device),
                     // A trimmed notification can drop the name while the book stays
                     // open, so the last name is kept for as long as `open` holds.
                     readerOpenBook = if (s.bookOpen) s.bookFilename ?: _state.value.readerOpenBook else null,
@@ -1268,6 +1277,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         invalidateReaderListing()
         _state.value = _state.value.copy(
             authorized = true,
+            // This session may be a different reader, so it establishes its own
+            // identity from its own statuses. The id this hello verified is in
+            // ble.authedDeviceId already, which is what deviceKey() reads first.
+            device = _state.value.device?.forgetIdentity(),
             pairing = PairingState.TRUSTED,
             link = LinkStatus(LinkStage.CONNECTED),
             authTrace = ble.lastAuthTrace,
@@ -1641,12 +1654,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Which reader the "sent" history belongs to. Prefers the live status, but
-     * falls back to the paired identity so the flags are right before the
-     * first connection of a session rather than reading an "unknown" bucket.
+     * Which reader every per-reader record belongs to: the removals owed, the
+     * "sent" history, owed resumes, fresh starts, book links, the dark-mode flag.
+     *
+     * THE key, and deliberately the only one. The prune and the greying have to
+     * agree about which reader this is, or a removal is drawn in one bucket and
+     * carried out from another -- which is exactly how a book went grey and was
+     * then never deleted.
+     *
+     * In order of authority: the id the hello actually verified for this link,
+     * which BleClient took from a GATT read and drops when the link does; then
+     * the live status, whose identity now survives trimmed notifications by
+     * being carried forward; then the paired identity, so the flags are right
+     * before the first connection of a session rather than reading an "unknown"
+     * bucket.
      */
     private suspend fun deviceKey(): String? =
-        _state.value.device?.deviceId ?: pairingStore.load()?.deviceId
+        ble.authedDeviceId ?: _state.value.device?.deviceId ?: pairingStore.load()?.deviceId
 
     /**
      * The reader-facing half of a position sync, and nothing that waits on the
@@ -3283,15 +3307,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * A reader listing, and whether it came off the reader in this very call.
+     *
+     * [fromReader] false means the kept copy answered. That copy is good enough
+     * to decide what to DELETE -- the reader confirms each delete itself -- but
+     * never good enough to conclude a book is GONE from the reader: [listingAdd]
+     * and [listingRemove] edit it locally, so a name missing from it may simply
+     * never have been written there. See [pruneDeviceBooksLocked].
+     */
+    private class ReaderListing(val entries: List<JSONObject>, val fromReader: Boolean)
+
+    /**
      * The reader's listing entries, copies. Kept when [forPositions] is false and
      * a listing is held; with [forPositions] also its positions must be current.
      * Null when the listing cannot be read or parsed -- never "the reader is empty".
      */
-    private suspend fun readerLibrary(forPositions: Boolean): List<JSONObject>? {
+    private suspend fun readerLibrary(forPositions: Boolean): List<JSONObject>? =
+        readerListing(forPositions)?.entries
+
+    /** [readerLibrary], and whether the answer was downloaded rather than kept. */
+    private suspend fun readerListing(forPositions: Boolean): ReaderListing? {
         readerEntries?.let { kept ->
             val positionsCurrent = !readerPositionsStale &&
                 System.currentTimeMillis() - readerEntriesAt < LISTING_POSITIONS_TTL_MS
-            if (!forPositions || positionsCurrent) return kept.map { JSONObject(it.toString()) }
+            if (!forPositions || positionsCurrent) {
+                return ReaderListing(kept.map { JSONObject(it.toString()) }, fromReader = false)
+            }
         }
         val bytes = runCatching {
             traced<ByteArray>("library", bytes = { it.size.toLong() }, note = { ble.lastDownloadShape }) {
@@ -3308,7 +3349,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         readerEntriesAt = System.currentTimeMillis()
         readerPositionsStale = false
         runCatching { bookLinks.saveListing(deviceKey(), parsed) }
-        return parsed
+        return ReaderListing(parsed, fromReader = true)
     }
 
     /** A book this app just put on the reader. A replace keeps its entry, and its position. */
@@ -3377,14 +3418,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun pruneDeviceBooksLocked(): Int {
         // A listing that cannot be read or parsed is null and stops here: it must
         // never read as "the reader is empty".
-        val listing = readerLibrary(forPositions = false) ?: run {
+        val listing = readerListing(forPositions = false) ?: run {
             tally?.problems?.add("library not read")
             return 0
         }
-        val onDevice = listing.mapNotNull { it.optString("filename").ifBlank { null } }
-        // The live reader's id only. deviceKey() falls back to the stored pairing and
-        // then to "unknown"; a record filed under either says nothing about THIS reader.
-        val readerId = _state.value.device?.deviceId ?: return 0
+        val onDevice = listing.entries.mapNotNull { it.optString("filename").ifBlank { null } }
+        // THE key -- the same one loadLibrary greys the row under. See [deviceKey].
+        //
+        // Reading the live status directly is what broke this: a trimmed
+        // notification carries no `device_id`, so within moments of connecting the
+        // id was null and the whole prune returned 0 -- deleting nothing, settling
+        // nothing, recording nothing, and still reporting the sync as done.
+        val readerId = deviceKey()
+        if (readerId == null) {
+            // Never silently, and never on a guess. Nothing in hand names a reader,
+            // so nothing is deleted and nothing is settled -- but the sync says so,
+            // in the trace and in its summary.
+            traceNote("prune", "skipped: reader id unknown")
+            tally?.problems?.add("reader id unknown")
+            return 0
+        }
+        // An assertion, not a fix: the two readings of this reader's identity must
+        // agree. They can differ only if a status arrived for a reader other than
+        // the one the hello verified -- which would mean records are being filed
+        // under one reader and acted on for another.
+        _state.value.device?.deviceId?.let { live ->
+            if (live != readerId) traceNote("prune", "reader id mismatch: status $live, key $readerId")
+        }
 
         val owed = pendingRemovals.load(readerId)
         val gone = mutableSetOf<String>()
@@ -3404,12 +3464,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         // Owed, but the reader no longer holds it: nothing to delete there.
+        //
+        // Only ever from a listing THIS pass downloaded. Settling drops the
+        // phone's copy, so concluding "gone from the reader" from the kept
+        // listing -- which listingAdd and listingRemove edit locally -- would
+        // throw the local copy away while the book stayed on the reader for good,
+        // with nothing left to draw the pending row from.
         var settled = 0
-        for (filename in owed) {
-            if (filename !in onDevice) {
-                settleRemoval(readerId, filename)
-                settled++
+        if (listing.fromReader) {
+            for (filename in owed) {
+                if (filename !in onDevice) {
+                    settleRemoval(readerId, filename)
+                    settled++
+                }
             }
+        } else if (owed.any { it !in onDevice }) {
+            traceNote("prune", "settle deferred: listing not read this pass")
         }
 
         _state.value = _state.value.copy(readerBookNames = onDevice.toSet() - gone)
