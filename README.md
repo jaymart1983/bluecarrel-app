@@ -9,7 +9,7 @@ nothing else.
 
 ## Test builds
 
-- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.16-test)** (download the APK on your phone)
+- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.17-test)** (download the APK on your phone)
 - **[Latest firmware release](https://github.com/jaymart1983/bluecarrel-firmware/releases/latest)**
 - [All app releases](https://github.com/jaymart1983/bluecarrel-app/releases)
 
