@@ -368,6 +368,11 @@ data class UiState(
     val linkInfo: String = "",
     /** The last firmware or book upload, with where its time went. Diagnostics. */
     val lastTransfer: String? = null,
+    /**
+     * The reader's `power` counters from its last `about` document, formatted;
+     * null when the reader does not report them. Diagnostics.
+     */
+    val readerPower: String? = null,
 ) {
     val connected: Boolean get() = connection == BleConnection.CONNECTED
 
@@ -392,10 +397,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /** A sync that found nothing to do this soon after one that did leaves that one on the bar. */
         const val SYNC_SUMMARY_HOLD_MS = 60_000L
 
-        /** How often the link is verified against the reader rather than assumed. */
+        /** How often the link watchdog wakes: reconnects while the reader is around. */
         const val LINK_CHECK_MS = 10_000L
+        /**
+         * While connected, the reader's status is read this often to catch a stale
+         * CONNECTED or a session the reader dropped. A backstop only: a reader
+         * that goes away drops the link within its 4-6 s supervision timeout, and
+         * sleep is announced by a notification.
+         */
+        const val LINK_STATUS_READ_MS = 30_000L
         const val RECONNECT_MIN_MS = 3_000L
         const val RECONNECT_MAX_MS = 60_000L
+        /**
+         * The reader last said it was going to sleep, or a scan could not find it:
+         * the watchdog retries this seldom, with a low-power scan. The presence
+         * scan (ReaderPresence) wakes the app as soon as the reader advertises.
+         */
+        const val AWAY_RETRY_MS = 5 * 60_000L
 
         /**
          * The OPDS view both the app's own list and the reader's Store browse.
@@ -505,6 +523,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var connectJob: Job? = null
     /** When a reader-presence broadcast last started an attempt. */
     private var lastNearbyAttemptAt = 0L
+    /**
+     * When the reader was last seen asleep (its `sleeping` notification) or not
+     * found by a scan; 0 while it is thought to be around. Declared ahead of init:
+     * init's collectors write it. See [AWAY_RETRY_MS].
+     */
+    private var readerAwaySince = 0L
+    /** When the watchdog last tried to reach a reader that is away. */
+    private var lastAwayAttemptAt = 0L
     /** Consecutive connect attempts that failed at the Bluetooth link itself. */
     private var linkFailStreak = 0
     /** A firmware send the link cut off; resumed when the reader reconnects. */
@@ -602,7 +628,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 traceNote("link", text)
                 _state.value = _state.value.copy(
                     linkInfo = "mtu ${ble.negotiatedMtu}, phy ${ble.phy ?: "?"}, " +
-                        "priority ${if (ble.fastLink) "high" else "balanced"}, " +
+                        "priority ${if (ble.fastLink) "high" else "low power"}, " +
                         "l2cap ${if (ble.l2capOpen) "open" else "-"}",
                 )
             }
@@ -656,7 +682,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             ble.connection.collect { c ->
-                if (c != BleConnection.CONNECTED) dropReaderTransfers()
+                if (c != BleConnection.CONNECTED) dropReaderTransfers() else readerAwaySince = 0L
                 val s = _state.value
                 _state.value = s.copy(
                     connection = c,
@@ -755,7 +781,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // Sleep ends a reading session. Publish now rather than leave the
                 // last pages waiting out the throttle -- the reader goes quiet
                 // after this notify and may not ping again for hours.
-                if (s.sleeping) flushHeartbeatPositions()
+                if (s.sleeping) {
+                    flushHeartbeatPositions()
+                    markReaderAway()
+                }
 
                 // 2. A full mirror only when the library actually differs.
                 //    The fingerprint is name+size+mtime over /Books; if it
@@ -906,13 +935,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * attempt at launch, where "no reader found" means "the reader is in a
      * drawer", not "something went wrong".
      */
-    fun connectReader(silent: Boolean = false): Job {
+    fun connectReader(silent: Boolean = false, lowPowerScan: Boolean = false): Job {
         // One attempt at a time. Startup, the link watchdog, the permission result and
         // every presence broadcast can all ask at once, and BleClient.connect() begins by
         // tearing down whatever link exists -- so a second attempt killed the first, the
         // first's cleanup killed the second, and every retry started another scan until
         // Android throttled this app's scans and the reader could not be found at all.
         connectJob?.takeIf { it.isActive }?.let { return it }
+        // Someone asked: the reader is worth looking for at full speed again.
+        if (!silent) readerAwaySince = 0L
         return viewModelScope.launch {
         if (!linkPreflight()) return@launch
 
@@ -934,7 +965,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         // Never bonds here: a background reconnect must not raise a pairing dialog.
         val connectStarted = System.currentTimeMillis()
-        val outcome = runCatching { ble.connect(address, allowBond = false) }
+        val outcome = runCatching { ble.connect(address, allowBond = false, lowPowerScan = lowPowerScan) }
         val status = outcome.getOrElse { e ->
             failLink(e, silent)
             return@launch
@@ -1590,6 +1621,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // reader is found and the link opens, then drops within two seconds, every
         // time, until Bluetooth is turned off and on. Retrying cannot fix that, so after
         // a few link-level failures in a row, say what will.
+        if (reason == BleClient.Reason.NOT_FOUND) markReaderAway()
         val linkLevel = reason == BleClient.Reason.LINK || reason == BleClient.Reason.OTHER ||
             reason == BleClient.Reason.SCAN_FAILED
         linkFailStreak = if (linkLevel) linkFailStreak + 1 else 0
@@ -2777,6 +2809,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         read.getOrNull()?.let { doc ->
             aboutDoc = doc
             rememberAboutFeatures(doc)
+            _state.value = _state.value.copy(readerPower = formatReaderPower(doc.optJSONObject("power")))
             // The name the reader advertises. Absent on older firmware.
             if (doc.has("device_name")) rememberDeviceName(doc.optString("device_name"))
         }
@@ -4459,6 +4492,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Reads `about` again for its `power` counters (Diagnostics). A download, so
+     * it counts as activity on the reader while it runs, like any transfer.
+     */
+    fun refreshReaderPower() = viewModelScope.launch {
+        if (!_state.value.connected || !_state.value.authorized) return@launch
+        readAbout(fresh = true)
+    }
+
+    /**
+     * The reader's `power` object as Diagnostics lines; null when absent (older
+     * firmware). Counters run from the reader's last wake.
+     */
+    private fun formatReaderPower(p: JSONObject?): String? {
+        if (p == null) return null
+        fun n(key: String): Long = p.optLong(key, -1L)
+        val full = n("cpu_full_ms")
+        val low = n("cpu_low_ms")
+        val cpuTotal = (full.coerceAtLeast(0) + low.coerceAtLeast(0)).coerceAtLeast(1)
+        return buildString {
+            append("awake ").append(n("awake_s")).append(" s\n")
+            append("cpu ").append(n("cpu_full_mhz")).append(" MHz ").append(full / 1000).append(" s")
+            append(" (").append(full.coerceAtLeast(0) * 100 / cpuTotal).append("%)")
+            append(", ").append(n("cpu_low_mhz")).append(" MHz ").append(low / 1000).append(" s\n")
+            append("loop/s avg ").append(n("loop_per_s_avg")).append(" max ").append(n("loop_per_s_max"))
+            append(" over ").append(n("window_s")).append(" s\n")
+            append("touch reads ").append(n("touch_reads"))
+            append(", /s avg ").append(n("touch_reads_per_s_avg")).append(" max ").append(n("touch_reads_per_s_max"))
+            append('\n')
+            append("panel waits ").append(n("panel_waits")).append(", ").append(n("panel_wait_ms") / 1000).append(" s")
+        }
+    }
+
+    /**
      * Pulls the reader's crash report, the one diagnostic the protocol offers.
      */
     fun fetchCrashReport() = viewModelScope.launch {
@@ -4665,9 +4731,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * a long session instead of only at the next reconnect. Silent: the only
      * visible result is the pill badge (or the upload itself).
      *
-     * Network only. The reader's version was read at connect; a Bluetooth request
-     * every few minutes would count as activity on the reader, reset its sleep
-     * timer each time, and keep it awake for as long as the phone is in range.
+     * Network only. The reader's version was read at connect and does not change
+     * while it stays connected, so asking again would only cost radio time. (It
+     * would not keep the reader awake: its sleep timer is reset by an open
+     * transfer -- a start_put or start_get, the small `about` download included --
+     * not by status reads or other requests.)
      */
     private fun pollFirmware() = viewModelScope.launch {
         while (isActive) {
@@ -5174,6 +5242,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun superviseLink() = viewModelScope.launch {
         var backoffMs = RECONNECT_MIN_MS
+        var lastStatusReadAt = 0L
         while (isActive) {
             delay(LINK_CHECK_MS)
             if (pairingInProgress) continue
@@ -5183,6 +5252,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             when (ble.connection.value) {
                 BleConnection.CONNECTED -> {
                     backoffMs = RECONNECT_MIN_MS
+                    val now = System.currentTimeMillis()
+                    if (now - lastStatusReadAt < LINK_STATUS_READ_MS) continue
+                    lastStatusReadAt = now
                     val status = runCatching { ble.readStatus() }.getOrNull()
                     if (status == null) {
                         // The peer is gone; Android just has not admitted it yet.
@@ -5195,6 +5267,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 BleConnection.IDLE -> {
+                    lastStatusReadAt = 0L
+                    if (readerAwaySince != 0L) {
+                        // Asleep or out of reach: an occasional low-power look, and
+                        // the presence scan for the moment it comes back.
+                        val now = System.currentTimeMillis()
+                        if (now - lastAwayAttemptAt < AWAY_RETRY_MS) continue
+                        lastAwayAttemptAt = now
+                        backoffMs = RECONNECT_MIN_MS
+                        connectReader(silent = true, lowPowerScan = true)
+                        continue
+                    }
                     connectReader(silent = true)
                     delay(backoffMs)
                     backoffMs = (backoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
@@ -5210,6 +5293,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun onReaderNearby() {
         viewModelScope.launch {
             if (pairingInProgress || pairingStore.load() == null) return@launch
+            // The reader is advertising: back to full-speed reconnects.
+            readerAwaySince = 0L
             // The presence scan reports every advertisement, several a second while the
             // reader waits for a phone. At most one attempt every NEARBY_RETRY_MS, and
             // never beside one already running.
@@ -5222,6 +5307,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     suspend fun isPaired(): Boolean = pairingStore.load() != null
+
+    /** The link is up; presence results are nothing to act on. */
+    fun isReaderConnected(): Boolean = ble.connection.value == BleConnection.CONNECTED
+
+    /** The reader went to sleep or could not be found; see [AWAY_RETRY_MS]. */
+    private fun markReaderAway() {
+        val now = System.currentTimeMillis()
+        if (readerAwaySince == 0L) readerAwaySince = now
+        lastAwayAttemptAt = now
+    }
 
     /** True while stopping the background service would cut something off. */
     fun hasBackgroundWork(): Boolean =

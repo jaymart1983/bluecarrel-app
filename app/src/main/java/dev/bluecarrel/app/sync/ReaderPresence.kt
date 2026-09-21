@@ -21,7 +21,13 @@ import dev.bluecarrel.app.data.PairingStore
  * result to [ReaderPresenceReceiver] even if the app was closed or killed. The
  * filter is the paired reader's Bluetooth address plus the service UUID, so no
  * other advertiser wakes the app, and LOW_POWER lets the controller do the
- * filtering.
+ * filtering. FIRST_MATCH reports the reader once when it starts advertising,
+ * not every advertisement: the reader advertises several times a second while
+ * it waits for a phone, and each report restarted the background service.
+ * It is reported again only after the controller has lost it (asleep, or
+ * connected, since the reader stops advertising while a phone is connected).
+ * A controller without hardware filtering refuses FIRST_MATCH; there it falls
+ * back to every match, and the receiver ignores results while connected.
  *
  * The registration does not survive a reboot, an app update or Bluetooth being
  * switched off, so it is renewed from each of those ([ReaderScanRegistrar]),
@@ -49,18 +55,25 @@ object ReaderPresence {
         val scanner = scanner(app) ?: return false
         val pi = pendingIntent(app)
         runCatching { scanner.stopScan(pi) }
-        return runCatching {
+        val filters = listOf(
+            ScanFilter.Builder()
+                .setDeviceAddress(address)
+                .setServiceUuid(ParcelUuid(BleClient.SERVICE))
+                .build()
+        )
+        fun start(callbackType: Int): Boolean = runCatching {
             scanner.startScan(
-                listOf(
-                    ScanFilter.Builder()
-                        .setDeviceAddress(address)
-                        .setServiceUuid(ParcelUuid(BleClient.SERVICE))
-                        .build()
-                ),
-                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(),
+                filters,
+                ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                    .setCallbackType(callbackType)
+                    .build(),
                 pi,
             ) == 0
         }.getOrDefault(false)
+        if (start(ScanSettings.CALLBACK_TYPE_FIRST_MATCH)) return true
+        runCatching { scanner.stopScan(pi) }
+        return start(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
     }
 
     /** After forgetting the pairing: an unpaired reader is nothing to wake up for. */

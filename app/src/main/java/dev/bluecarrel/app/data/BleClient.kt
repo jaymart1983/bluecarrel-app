@@ -205,7 +205,7 @@ class BleClient(private val context: Context) {
         /** After the last byte, how long to wait for the reader's `sent`. */
         private const val SENT_GRACE_MS = 1_500L
 
-        /** Balanced priority is restored this long after the last transfer or sync ends. */
+        /** Low-power priority is requested this long after the last transfer or sync ends. */
         private const val FAST_LINK_LINGER_MS = 2_000L
         /** The PHY is read back this long after asking for 2M. */
         private const val PHY_READ_DELAY_MS = 1_500L
@@ -790,9 +790,14 @@ class BleClient(private val context: Context) {
      * is refused, so a background reconnect never raises a pairing dialog.
      *
      * Refuses a reader below protocol_version 2.
+     *
+     * [lowPowerScan] scans in SCAN_MODE_LOW_POWER instead of LOW_LATENCY: for the
+     * background retries while the reader is asleep or out of reach, where the
+     * scan is expected to find nothing and the presence scan ([ReaderPresence])
+     * is what notices the reader coming back.
      */
     @SuppressLint("MissingPermission")
-    suspend fun connect(address: String, allowBond: Boolean = false): DeviceStatus {
+    suspend fun connect(address: String, allowBond: Boolean = false, lowPowerScan: Boolean = false): DeviceStatus {
         if (_connection.value == BleConnection.CONNECTED &&
             gatt?.device?.address.equals(address, ignoreCase = true)
         ) {
@@ -802,7 +807,7 @@ class BleClient(private val context: Context) {
         val seen = discovered.remove(address.uppercase())
         _connection.value = if (seen != null) BleConnection.CONNECTING else BleConnection.SCANNING
         try {
-            val device = seen ?: scanForReader(address)
+            val device = seen ?: scanForReader(address, lowPowerScan)
             _connection.value = BleConnection.CONNECTING
 
             connectGate = CompletableDeferred()
@@ -1003,7 +1008,7 @@ class BleClient(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun scanForReader(address: String): BluetoothDevice {
+    private suspend fun scanForReader(address: String, lowPower: Boolean): BluetoothDevice {
         val scanner = adapter().bluetoothLeScanner
             ?: throw BleException("Bluetooth scanning is unavailable", reason = Reason.SCAN_FAILED)
         return withTimeoutOrNull(SCAN_TIMEOUT_MS) {
@@ -1042,7 +1047,9 @@ class BleClient(private val context: Context) {
                                 .build()
                         ),
                         ScanSettings.Builder()
-                            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                            .setScanMode(
+                                if (lowPower) ScanSettings.SCAN_MODE_LOW_POWER else ScanSettings.SCAN_MODE_LOW_LATENCY
+                            )
                             .build(),
                         cb,
                     )
@@ -1155,8 +1162,14 @@ class BleClient(private val context: Context) {
      * [releaseFastLink]. Android keeps a link at its balanced 30-50 ms interval
      * unless the app asks, and every frame and every acknowledgement waits on
      * that interval. Held for a whole sync, not per request, so the interval is
-     * not renegotiated between steps; balanced again [FAST_LINK_LINGER_MS] after
-     * the last hold ends.
+     * not renegotiated between steps; LOW_POWER [FAST_LINK_LINGER_MS] after the
+     * last hold ends.
+     *
+     * LOW_POWER (Android: 100-125 ms, latency 2) sits inside the reader's own
+     * idle request (100-150 ms, latency 4), so the reader, which only re-asks
+     * when the interval is below 100 ms, leaves it alone: the two do not fight.
+     * The next sync or transfer takes a hold first, which asks for HIGH before
+     * any start_put/start_get is written.
      *
      * Ordering with the reader's own request. HIGH asks Android for 11.25-15 ms
      * (config gatt_high_priority_min/max_interval 9/12) and phones usually settle
@@ -1168,7 +1181,7 @@ class BleClient(private val context: Context) {
      * overwrite the link's stored parameters), so the reader's 7.5 ms wins. The app
      * therefore requests priority only when the hold count goes 0 -> 1 and on
      * reconnect ([setPriority] ignores a request for the priority already in force),
-     * never mid-transfer, and balanced only after the last hold ends. When the two
+     * never mid-transfer, and low power only after the last hold ends. When the two
      * requests collide at the link layer, the reader repeats its own.
      */
     fun holdFastLink() {
@@ -1201,11 +1214,11 @@ class BleClient(private val context: Context) {
         if (priorityHigh == high) return
         val ok = runCatching {
             g.requestConnectionPriority(
-                if (high) BluetoothGatt.CONNECTION_PRIORITY_HIGH else BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+                if (high) BluetoothGatt.CONNECTION_PRIORITY_HIGH else BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
             )
         }.getOrDefault(false)
         if (ok) priorityHigh = high
-        onLinkEvent?.invoke("priority " + (if (high) "high" else "balanced") + (if (ok) "" else " refused"))
+        onLinkEvent?.invoke("priority " + (if (high) "high" else "low power") + (if (ok) "" else " refused"))
     }
 
     private suspend fun writeControl(command: JSONObject) {
@@ -1688,7 +1701,7 @@ class BleClient(private val context: Context) {
             append(" · commit ").append(SyncTrace.duration(commitMs))
             append(" · mtu ").append(mtu)
             append(" · phy ").append(phy ?: "?")
-            append(" · priority ").append(if (priorityHigh) "high" else "balanced")
+            append(" · priority ").append(if (priorityHigh) "high" else "not high")
             append(" · transport ").append(transport)
             if (error != null) append(" · failed: ").append(error.take(60))
         }

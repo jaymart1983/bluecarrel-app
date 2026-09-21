@@ -326,6 +326,7 @@ fun AppScaffold(vm: MainViewModel) {
             onForgetPairing = { vm.forgetPairing() },
             onPair = { settingsSection = null; showPairing = true },
             onCrashReport = { vm.fetchCrashReport(); settingsSection = null },
+            onRefreshReaderPower = { vm.refreshReaderPower() },
             onCheckFirmware = { vm.checkFirmware() },
             onInstallFirmware = { vm.installLatestFirmware(); settingsSection = null },
         )
@@ -1712,6 +1713,7 @@ private fun SettingsSheet(
     onForgetPairing: () -> Unit,
     onPair: () -> Unit,
     onCrashReport: () -> Unit,
+    onRefreshReaderPower: () -> Unit,
     onCheckFirmware: () -> Unit,
     onInstallFirmware: () -> Unit,
 ) {
@@ -1892,6 +1894,8 @@ private fun SettingsSheet(
                             append("last auth attempt:\n").append(state.authTrace)
                             append("\nstore:\n").append(state.storeTrace)
                             append("\n\nlink: ").append(state.linkInfo.ifBlank { "-" })
+                            append("\n\nreader power (since its last wake):\n")
+                            append(state.readerPower ?: "not reported")
                             append("\n\nlast transfer:\n").append(state.lastTransfer ?: "none yet")
                             append("\n\nlast sync:\n")
                             append(state.syncTrace.joinToString("\n").ifBlank { "none yet" })
@@ -1907,6 +1911,11 @@ private fun SettingsSheet(
                             state.device?.downloadKinds?.contains("crash_report") == true,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Get crash report") }
+                    OutlinedButton(
+                        onClick = onRefreshReaderPower,
+                        enabled = state.connected && state.authorized,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Refresh reader power") }
                 }
             }
 

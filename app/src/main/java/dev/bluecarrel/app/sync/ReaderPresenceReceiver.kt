@@ -17,6 +17,10 @@ import kotlinx.coroutines.launch
 class ReaderPresenceReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val app = context.applicationContext
+        // Already connected: the service is running for the link and there is
+        // nothing to connect. (A controller that could not take FIRST_MATCH
+        // reports every advertisement.)
+        if ((app as? BluecarrelApp)?.engine?.isReaderConnected() == true) return
         // Deliberately not inspecting the scan results. The only decision they
         // support is "worth connecting now", and the engine re-checks the rest.
         if (!ReaderSyncService.start(app)) {

@@ -29,8 +29,8 @@ android {
         // Bump BOTH on every published build. Android only offers an APK as an
         // update when versionCode increases, and Diagnostics shows versionName so
         // the running build can be identified from the phone.
-        versionCode = 18
-        versionName = "1.0.17"
+        versionCode = 19
+        versionName = "1.0.18"
     }
 
     signingConfigs {
