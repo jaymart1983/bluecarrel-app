@@ -393,6 +393,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val OWNER_CALIBRE = "calibre"
         const val OWNER_SETTINGS = "settings"
         const val OWNER_CRASH = "crash"
+        const val OWNER_POWER_LOG = "power_log"
 
         /** A sync that found nothing to do this soon after one that did leaves that one on the bar. */
         const val SYNC_SUMMARY_HOLD_MS = 60_000L
@@ -687,10 +688,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = s.copy(
                     connection = c,
                     authorized = if (c == BleConnection.CONNECTED) s.authorized else false,
-                    // The identity carried across trimmed notifications belongs to
-                    // the link that reported it. A link that has dropped must not
-                    // lend its reader's id to whatever connects next.
-                    device = if (c == BleConnection.CONNECTED) s.device else s.device?.forgetIdentity(),
+                    // The identity and the capabilities carried across trimmed
+                    // notifications belong to the link that reported them. A link
+                    // that has dropped must not lend its reader's id, or its
+                    // firmware's transfer kinds, to whatever connects next.
+                    device = if (c == BleConnection.CONNECTED) s.device else s.device?.forgetSession(),
                     storeActivity = if (c == BleConnection.CONNECTED) s.storeActivity else null,
                     readerOpenBook = if (c == BleConnection.CONNECTED) s.readerOpenBook else null,
                     link = when (c) {
@@ -4525,27 +4527,58 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Pulls the reader's crash report, the one diagnostic the protocol offers.
+     * Pulls the reader's crash report.
      */
-    fun fetchCrashReport() = viewModelScope.launch {
-        val kinds = _state.value.device?.downloadKinds.orEmpty()
-        if ("crash_report" !in kinds) {
-            _state.value = _state.value.copy(message = "This reader has no crash report to send")
-            return@launch
+    fun fetchCrashReport() = fetchDiagnostic(
+        kind = "crash_report",
+        filename = "crash_report.txt",
+        label = "Crash report",
+        owner = OWNER_CRASH,
+    )
+
+    /**
+     * Pulls the reader's power event log: one CSV line per wake, sleep, book,
+     * light change, transfer and charger edge, with the gauge reading beside it.
+     * The sleep/wake pairs in it are what make standby drain measurable.
+     */
+    fun fetchPowerLog() = fetchDiagnostic(
+        kind = "power_log",
+        filename = "power_log.csv",
+        label = "Power log",
+        owner = OWNER_POWER_LOG,
+    )
+
+    /**
+     * One download kind, saved into the app's diagnostics folder.
+     *
+     * An EMPTY `download_kinds` means "this status did not say", not "the reader
+     * cannot": the firmware writes the list for a GATT read only, and although
+     * [DeviceStatus.carryIdentityFrom] now carries it across trimmed
+     * notifications, a link whose read never landed still has none. Every other
+     * capability gate in this file reads the same way round.
+     */
+    private fun fetchDiagnostic(kind: String, filename: String, label: String, owner: String) =
+        viewModelScope.launch {
+            val kinds = _state.value.device?.downloadKinds.orEmpty()
+            if (kinds.isNotEmpty() && kind !in kinds) {
+                _state.value = _state.value.copy(
+                    message = "This reader's firmware cannot send its $label over Bluetooth"
+                )
+                return@launch
+            }
+            showTransfer(TransferProgress(label, 0, 0, owner = owner))
+            val outcome = runCatching { ble.download(kind) }
+            endTransfer(owner)
+            _state.value = _state.value.copy(
+                message = outcome.fold(
+                    onSuccess = { bytes ->
+                        books.writeDiagnostic(filename, bytes)
+                        "Saved $filename (${bytes.size} bytes)"
+                    },
+                    onFailure = { "$label failed: ${it.message}" },
+                ),
+            )
         }
-        showTransfer(TransferProgress("Crash report", 0, 0, owner = OWNER_CRASH))
-        val outcome = runCatching { ble.download("crash_report") }
-        endTransfer(OWNER_CRASH)
-        _state.value = _state.value.copy(
-            message = outcome.fold(
-                onSuccess = { bytes ->
-                    books.writeDiagnostic("crash_report.txt", bytes)
-                    "Saved crash_report.txt (${bytes.size} bytes)"
-                },
-                onFailure = { "Crash report failed: ${it.message}" },
-            ),
-        )
-    }
 
     /**
      * Stages a downloaded, signed image on the reader and reports what the reader

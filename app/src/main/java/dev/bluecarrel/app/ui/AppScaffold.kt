@@ -326,6 +326,7 @@ fun AppScaffold(vm: MainViewModel) {
             onForgetPairing = { vm.forgetPairing() },
             onPair = { settingsSection = null; showPairing = true },
             onCrashReport = { vm.fetchCrashReport(); settingsSection = null },
+            onPowerLog = { vm.fetchPowerLog(); settingsSection = null },
             onRefreshReaderPower = { vm.refreshReaderPower() },
             onCheckFirmware = { vm.checkFirmware() },
             onInstallFirmware = { vm.installLatestFirmware(); settingsSection = null },
@@ -1713,6 +1714,7 @@ private fun SettingsSheet(
     onForgetPairing: () -> Unit,
     onPair: () -> Unit,
     onCrashReport: () -> Unit,
+    onPowerLog: () -> Unit,
     onRefreshReaderPower: () -> Unit,
     onCheckFirmware: () -> Unit,
     onInstallFirmware: () -> Unit,
@@ -1905,12 +1907,22 @@ private fun SettingsSheet(
                         style = MaterialTheme.typography.bodySmall,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     )
+                    // An empty download_kinds means this status did not carry the
+                    // list (the firmware writes it for a GATT read only), not
+                    // that the reader has nothing to offer -- so an unknown list
+                    // leaves the button live and the reader answers for itself.
+                    val kinds = state.device?.downloadKinds.orEmpty()
+                    val canDownload = { kind: String -> kinds.isEmpty() || kind in kinds }
                     OutlinedButton(
                         onClick = onCrashReport,
-                        enabled = state.connected && state.authorized &&
-                            state.device?.downloadKinds?.contains("crash_report") == true,
+                        enabled = state.connected && state.authorized && canDownload("crash_report"),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Get crash report") }
+                    OutlinedButton(
+                        onClick = onPowerLog,
+                        enabled = state.connected && state.authorized && canDownload("power_log"),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Get power log") }
                     OutlinedButton(
                         onClick = onRefreshReaderPower,
                         enabled = state.connected && state.authorized,

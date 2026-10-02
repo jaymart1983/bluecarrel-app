@@ -440,17 +440,46 @@ data class DeviceStatus(
      * invented. [raw] deliberately stays the text that really arrived, so
      * Diagnostics shows the wire document rather than a merged one.
      */
-    fun carryIdentityFrom(previous: DeviceStatus?): DeviceStatus =
+    fun carryIdentityFrom(previous: DeviceStatus?): DeviceStatus {
+        if (previous == null) return this
         // CARRIED: device_id. It is constant for the life of the reader, so the
         // last status's answer is still this one's -- and it is the key every
         // per-reader record is filed under.
         //
-        // NOT CARRIED, deliberately: device_nonce, the only other READ-only
-        // field. The reader rotates it on every accepted hello, so a kept one is
-        // stale by definition -- BleClient re-reads the characteristic for each
-        // authentication rather than trust a cached status, and a stale nonce
-        // here could only mislead a reader of this field.
-        if (previous == null || deviceId != null) this else copy(deviceId = previous.deviceId)
+        // CARRIED: the capability facts. `upload_kinds`, `download_kinds`,
+        // `firmware_name`, `firmware_ota_supported` and `resume_supported` are
+        // written for a GATT READ only; `protocol_version` and `store_supported`
+        // only for a READ or a notification the reader did not have to trim. All
+        // of them are constant for the life of the link, so the read taken while
+        // connecting is still the answer -- but the status collector replaces
+        // state.device wholesale, so the first trimmed notification after it
+        // turned every capability off. That is what greyed out "Get crash
+        // report": a reader that had just told us it can send one was recorded
+        // as advertising no download kinds at all.
+        //
+        // NOT CARRIED, deliberately:
+        //  * device_nonce, the other READ-only field. The reader rotates it on
+        //    every accepted hello, so a kept one is stale by definition --
+        //    BleClient re-reads the characteristic for each authentication
+        //    rather than trust a cached status.
+        //  * has_trusted_host / trusted_host / paired / pairing / auth_error.
+        //    These describe how far THIS link has got, not what the reader can
+        //    do, and they change while it is up; the pairing screen reads them
+        //    live and a carried value would show a bond that is no longer there.
+        //  * state, error and the byte counters: the notification is the
+        //    doorbell for exactly those, so a stale one is the one thing worse
+        //    than none.
+        return copy(
+            deviceId = deviceId ?: previous.deviceId,
+            uploadKinds = uploadKinds.ifEmpty { previous.uploadKinds },
+            downloadKinds = downloadKinds.ifEmpty { previous.downloadKinds },
+            firmwareName = firmwareName ?: previous.firmwareName,
+            firmwareOtaSupported = firmwareOtaSupported || previous.firmwareOtaSupported,
+            resumeSupported = resumeSupported || previous.resumeSupported,
+            protocolVersion = protocolVersion ?: previous.protocolVersion,
+            storeSupported = storeSupported || previous.storeSupported,
+        )
+    }
 
     /**
      * This status with the carried identity dropped.
@@ -459,8 +488,32 @@ data class DeviceStatus(
      * each establish their own: lending the last reader's id to the first
      * trimmed notification of the next connection would file one reader's books
      * under another reader's name.
+     *
+     * Deliberately identity only. A session is authorised moments after the
+     * post-hello status READ -- the one read that carries the capability lists at
+     * all -- so clearing those here would throw away the only copy of them and
+     * grey the diagnostics buttons out again. A genuinely new link clears them
+     * through [forgetSession].
      */
     fun forgetIdentity(): DeviceStatus = copy(deviceId = null)
+
+    /**
+     * This status with the identity AND the session capabilities dropped, for a
+     * link that has gone.
+     *
+     * The next connection may be a different reader or newer firmware, and a
+     * carried `download_kinds` would offer a transfer the reader in front of the
+     * user cannot do. Its own status READ fills them in again.
+     */
+    fun forgetSession(): DeviceStatus = forgetIdentity().copy(
+        uploadKinds = emptyList(),
+        downloadKinds = emptyList(),
+        firmwareName = null,
+        firmwareOtaSupported = false,
+        resumeSupported = false,
+        protocolVersion = null,
+        storeSupported = false,
+    )
 
     companion object {
         fun parse(json: String): DeviceStatus? = runCatching {
