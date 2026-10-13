@@ -2,4 +2,7 @@
 <paths>
     <!-- Cached EPUBs handed to other readers (KOReader) via FileProvider. -->
     <files-path name="books" path="books/" />
+    <!-- Diagnostics pulled off the reader (power log, crash report), shared out
+         of the app so they can be sent to someone who can read them. -->
+    <files-path name="diagnostics" path="diagnostics/" />
 </paths>

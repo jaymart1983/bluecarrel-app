@@ -79,8 +79,14 @@ class BookStore(private val context: Context) {
             }
 
     /**
-     * Somewhere to put things pulled off the reader (its crash report). Kept
-     * out of the books directory so it never shows up as a cached title.
+     * Somewhere to put things pulled off the reader (its crash report, its power
+     * log). Kept out of the books directory so it never shows up as a cached
+     * title.
+     *
+     * Private storage, so this is a staging post and not the destination: the
+     * user cannot reach filesDir from any file manager. [shareDiagnosticIntent]
+     * and the app's Save to file (ACTION_CREATE_DOCUMENT) are what put a copy
+     * somewhere they can find it; this one stays so either can be retried.
      */
     fun writeDiagnostic(name: String, bytes: ByteArray): File {
         val target = File(File(context.filesDir, "diagnostics").apply { mkdirs() }, name)
@@ -127,6 +133,32 @@ class BookStore(private val context: Context) {
         return Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, EPUB_MIME)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    /**
+     * Hands a fetched diagnostic to whatever can send a file — mail, chat — via
+     * FileProvider. ACTION_SEND rather than VIEW: a power log is something to
+     * pass on to someone who can read it, and little on a phone opens a CSV.
+     *
+     * Needs the `diagnostics` entry in res/xml/file_paths.xml; null when the
+     * file has gone or the provider will not grant it (both end as one message).
+     */
+    fun shareDiagnosticIntent(file: File, mimeType: String, name: String): Intent? {
+        if (!file.exists()) return null
+        val uri = runCatching {
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        }.getOrNull() ?: return null
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, name)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        // A chooser, not a resolved activity: this is a one-off, so "always use
+        // this app" is the wrong thing to be teaching the phone.
+        return Intent.createChooser(send, "Send $name").apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
     }

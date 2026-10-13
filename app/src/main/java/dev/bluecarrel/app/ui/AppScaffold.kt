@@ -50,6 +50,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.bluecarrel.app.AppTab
+import dev.bluecarrel.app.FetchedDiagnostic
 import dev.bluecarrel.app.FirmwarePhase
 import dev.bluecarrel.app.FirmwareProgress
 import dev.bluecarrel.app.LinkPicker
@@ -325,8 +326,13 @@ fun AppScaffold(vm: MainViewModel) {
             onSave = { vm.saveConfig(it); settingsSection = null },
             onForgetPairing = { vm.forgetPairing() },
             onPair = { settingsSection = null; showPairing = true },
-            onCrashReport = { vm.fetchCrashReport(); settingsSection = null },
-            onPowerLog = { vm.fetchPowerLog(); settingsSection = null },
+            // The sheet stays open, unlike a firmware send: the file, its last
+            // lines and the two things to do with it all appear in this panel,
+            // and closing it would send the user back here to find them.
+            onCrashReport = { vm.fetchCrashReport() },
+            onPowerLog = { vm.fetchPowerLog() },
+            onSaveDiagnostic = { vm.saveDiagnostic(it) },
+            onShareDiagnostic = { vm.shareDiagnostic() },
             onRefreshReaderPower = { vm.refreshReaderPower() },
             onCheckFirmware = { vm.checkFirmware() },
             onInstallFirmware = { vm.installLatestFirmware(); settingsSection = null },
@@ -1715,6 +1721,9 @@ private fun SettingsSheet(
     onPair: () -> Unit,
     onCrashReport: () -> Unit,
     onPowerLog: () -> Unit,
+    /** The document the user picked for the fetched diagnostic; null if they cancelled. */
+    onSaveDiagnostic: (Uri?) -> Unit,
+    onShareDiagnostic: () -> Unit,
     onRefreshReaderPower: () -> Unit,
     onCheckFirmware: () -> Unit,
     onInstallFirmware: () -> Unit,
@@ -1913,14 +1922,17 @@ private fun SettingsSheet(
                     // leaves the button live and the reader answers for itself.
                     val kinds = state.device?.downloadKinds.orEmpty()
                     val canDownload = { kind: String -> kinds.isEmpty() || kind in kinds }
+                    val fetching = state.fetchingDiagnostic
                     OutlinedButton(
                         onClick = onCrashReport,
-                        enabled = state.connected && state.authorized && canDownload("crash_report"),
+                        enabled = state.connected && state.authorized &&
+                            canDownload("crash_report") && fetching == null,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Get crash report") }
                     OutlinedButton(
                         onClick = onPowerLog,
-                        enabled = state.connected && state.authorized && canDownload("power_log"),
+                        enabled = state.connected && state.authorized &&
+                            canDownload("power_log") && fetching == null,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Get power log") }
                     OutlinedButton(
@@ -1928,6 +1940,21 @@ private fun SettingsSheet(
                         enabled = state.connected && state.authorized,
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Refresh reader power") }
+                    // This sheet is drawn over the transfer bar, so a download
+                    // started from it says so here or nowhere.
+                    if (fetching != null) {
+                        Text(
+                            "Getting the ${fetching.lowercase()}…",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    state.diagnostic?.let { d ->
+                        FetchedDiagnosticBlock(
+                            diagnostic = d,
+                            onSave = onSaveDiagnostic,
+                            onShare = onShareDiagnostic,
+                        )
+                    }
                 }
             }
 
@@ -1942,6 +1969,54 @@ private fun SettingsSheet(
             }
         }
     }
+}
+
+/**
+ * A diagnostic file just pulled off the reader: enough of it to read here, and
+ * the whole of it to keep.
+ *
+ * Read-here first on purpose. A crash report is a few lines and answers the
+ * question on the spot, so needing a file at all is the uncommon case -- and the
+ * tail is bounded, because a power log runs to 64 KB.
+ *
+ * Save goes through ACTION_CREATE_DOCUMENT: the user picks the folder and the
+ * name, which is the whole point (the app's own copy is in private storage, where
+ * no file manager can reach it), and scoped storage means no permission to ask
+ * for. The private copy is kept, so a cancelled save is just another tap.
+ */
+@Composable
+private fun FetchedDiagnosticBlock(
+    diagnostic: FetchedDiagnostic,
+    onSave: (Uri?) -> Unit,
+    onShare: () -> Unit,
+) {
+    val d = diagnostic
+    val save = rememberLauncherForActivityResult(
+        remember(d.mimeType) { ActivityResultContracts.CreateDocument(d.mimeType) },
+        onSave,
+    )
+    val size = if (d.sizeBytes < 1024) "${d.sizeBytes} bytes" else "${(d.sizeBytes + 1023) / 1024} KB"
+    val shownLines = d.tail.lines().size
+
+    HorizontalDivider()
+    Text("${d.label} · $size · ${d.lines} lines", style = MaterialTheme.typography.bodyMedium)
+    Text(
+        when {
+            d.tail.isBlank() -> "the file is empty"
+            d.lines <= shownLines -> "the whole file:\n${d.tail}"
+            else -> "last $shownLines lines:\n${d.tail}"
+        },
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Button(
+            onClick = { save.launch(d.suggestedName) },
+            modifier = Modifier.weight(1f),
+        ) { Text("Save to file") }
+        OutlinedButton(onClick = onShare, modifier = Modifier.weight(1f)) { Text("Share") }
+    }
+    d.saveNote?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
 }
 
 @Composable

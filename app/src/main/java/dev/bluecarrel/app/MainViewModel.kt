@@ -5,6 +5,7 @@ import android.content.ComponentCallbacks
 import android.content.Intent
 import android.content.res.Configuration
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import dev.bluecarrel.app.sync.ReaderPresence
@@ -36,6 +37,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import okhttp3.OkHttpClient
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -214,6 +218,39 @@ data class DeviceSettingsUi(
     fun isChanged(key: String): Boolean = edits.containsKey(key) || textEdits.containsKey(key)
 }
 
+/**
+ * A diagnostic file pulled off the reader, sitting in app-private storage.
+ *
+ * The private copy is kept on purpose: it is what [MainViewModel.saveDiagnostic]
+ * copies into the document the user picks, so a save that was cancelled or
+ * failed can simply be tapped again instead of pulling the file off the reader
+ * a second time. App-private storage is also the one place the file can go
+ * without asking anybody anything -- it is just not a place the user can find,
+ * which is why nothing stops there any more.
+ *
+ * [tail] is the end of the file, bounded: the power log runs to 64 KB and the
+ * panel only ever shows the last few lines of it. [path] is still all of it.
+ */
+data class FetchedDiagnostic(
+    /** "Power log" / "Crash report": what the panel and the messages call it. */
+    val label: String,
+    /** The private copy; the source for a save or a share. */
+    val path: String,
+    /** Pre-filled picker name, e.g. `bluecarrel-power-log-20261013-1934.csv`. */
+    val suggestedName: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+    val lines: Int,
+    /** The last lines of the file, for reading in the panel without saving it. */
+    val tail: String,
+    /**
+     * How the last save ended. Shown in the panel as well as the snackbar: the
+     * settings sheet is drawn over the snackbar host, so a result that went only
+     * to the snackbar would be read by nobody.
+     */
+    val saveNote: String? = null,
+)
+
 data class UiState(
     val config: Config = Config(),
     val rows: List<BookRow> = emptyList(),
@@ -373,6 +410,16 @@ data class UiState(
      * null when the reader does not report them. Diagnostics.
      */
     val readerPower: String? = null,
+    /**
+     * The label of the diagnostic download running, or null.
+     *
+     * Written by the code doing the work rather than read off [transfer], which
+     * carries whatever transfer is being SHOWN -- and the settings sheet covers
+     * the transfer bar anyway, so the fetch has to say so inside the sheet.
+     */
+    val fetchingDiagnostic: String? = null,
+    /** The diagnostic file last pulled off the reader, waiting to be saved or sent. */
+    val diagnostic: FetchedDiagnostic? = null,
 ) {
     val connected: Boolean get() = connection == BleConnection.CONNECTED
 
@@ -394,6 +441,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val OWNER_SETTINGS = "settings"
         const val OWNER_CRASH = "crash"
         const val OWNER_POWER_LOG = "power_log"
+
+        /** How much of a fetched diagnostic the panel shows, and how much of it is decoded to find it. */
+        const val DIAG_TAIL_LINES = 20
+        const val DIAG_TAIL_BYTES = 8 * 1024
 
         /** A sync that found nothing to do this soon after one that did leaves that one on the bar. */
         const val SYNC_SUMMARY_HOLD_MS = 60_000L
@@ -4533,6 +4584,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         kind = "crash_report",
         filename = "crash_report.txt",
         label = "Crash report",
+        saveAs = "bluecarrel-crash-report",
+        mimeType = "text/plain",
         owner = OWNER_CRASH,
     )
 
@@ -4545,11 +4598,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         kind = "power_log",
         filename = "power_log.csv",
         label = "Power log",
+        saveAs = "bluecarrel-power-log",
+        mimeType = "text/csv",
         owner = OWNER_POWER_LOG,
     )
 
     /**
-     * One download kind, saved into the app's diagnostics folder.
+     * One download kind, into the app's private diagnostics folder and onto the
+     * Diagnostics panel.
+     *
+     * The private file is a staging post, not the destination: it is invisible to
+     * the user and to every file manager on the phone, which is why the panel
+     * then offers the end of the file to read and the whole of it to save
+     * ([saveDiagnostic]) or send ([shareDiagnostic]).
      *
      * An EMPTY `download_kinds` means "this status did not say", not "the reader
      * cannot": the firmware writes the list for a GATT read only, and although
@@ -4557,7 +4618,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * notifications, a link whose read never landed still has none. Every other
      * capability gate in this file reads the same way round.
      */
-    private fun fetchDiagnostic(kind: String, filename: String, label: String, owner: String) =
+    private fun fetchDiagnostic(
+        kind: String,
+        filename: String,
+        label: String,
+        saveAs: String,
+        mimeType: String,
+        owner: String,
+    ) =
         viewModelScope.launch {
             val kinds = _state.value.device?.downloadKinds.orEmpty()
             if (kinds.isNotEmpty() && kind !in kinds) {
@@ -4566,19 +4634,135 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return@launch
             }
-            showTransfer(TransferProgress(label, 0, 0, owner = owner))
+            showTransfer(TransferProgress(label, 0, 0, owner = owner)) {
+                it.copy(fetchingDiagnostic = label)
+            }
             val outcome = runCatching { ble.download(kind) }
             endTransfer(owner)
+            // mapCatching: writing the private copy is disk IO and can fail on
+            // its own, and a throw out here would take the app with it.
+            val stored = outcome.mapCatching { bytes ->
+                storeDiagnostic(bytes, filename, label, saveAs, mimeType)
+            }
             _state.value = _state.value.copy(
-                message = outcome.fold(
-                    onSuccess = { bytes ->
-                        books.writeDiagnostic(filename, bytes)
-                        "Saved $filename (${bytes.size} bytes)"
-                    },
+                fetchingDiagnostic = null,
+                // A failed fetch leaves the last good file in place: it is still
+                // on the phone and still worth saving.
+                diagnostic = stored.getOrNull() ?: _state.value.diagnostic,
+                message = stored.fold(
+                    onSuccess = { "$label ready. Save or share it below." },
                     onFailure = { "$label failed: ${it.message}" },
                 ),
             )
         }
+
+    /** Writes the downloaded bytes to private storage and describes them for the panel. */
+    private fun storeDiagnostic(
+        bytes: ByteArray,
+        filename: String,
+        label: String,
+        saveAs: String,
+        mimeType: String,
+    ): FetchedDiagnostic {
+        val file = books.writeDiagnostic(filename, bytes)
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+        val newline = '\n'.code.toByte()
+        return FetchedDiagnostic(
+            label = label,
+            path = file.path,
+            // Dated, because the point of saving one is comparing it with the
+            // last one, and two files called power_log.csv cannot be.
+            suggestedName = "$saveAs-$stamp." + filename.substringAfterLast('.', "txt"),
+            mimeType = mimeType,
+            sizeBytes = bytes.size.toLong(),
+            lines = bytes.count { it == newline } +
+                if (bytes.isNotEmpty() && bytes.last() != newline) 1 else 0,
+            tail = tailLines(bytes, DIAG_TAIL_LINES),
+        )
+    }
+
+    /**
+     * The last [want] lines of [bytes], decoded from at most [DIAG_TAIL_BYTES]
+     * of the end. Only the end is decoded: the panel shows the tail, and a 64 KB
+     * power log has no business becoming a String to find it.
+     */
+    private fun tailLines(bytes: ByteArray, want: Int): String {
+        val from = (bytes.size - DIAG_TAIL_BYTES).coerceAtLeast(0)
+        val text = String(bytes, from, bytes.size - from, Charsets.UTF_8)
+        // A window that starts mid-file starts mid-line; drop that fragment.
+        val lines = text.split('\n').let { if (from > 0 && it.size > 1) it.drop(1) else it }
+        return lines.map { it.trimEnd('\r') }
+            .filter { it.isNotBlank() }
+            .takeLast(want)
+            .joinToString("\n")
+    }
+
+    /**
+     * Copies the fetched diagnostic into the document the user picked, or says
+     * why nothing was saved. [uri] is null when the picker was cancelled.
+     *
+     * ACTION_CREATE_DOCUMENT, so the file lands where the user says under a name
+     * they chose, with no storage permission to ask for. The private copy stays,
+     * so Save can be tapped again after a cancel or a failure.
+     */
+    fun saveDiagnostic(uri: Uri?) = viewModelScope.launch {
+        val d = _state.value.diagnostic ?: return@launch
+        if (uri == null) {
+            noteSave("${d.label} not saved. Tap Save to file to try again.")
+            return@launch
+        }
+        val app = getApplication<Application>()
+        val outcome = runCatching {
+            withContext(Dispatchers.IO) {
+                app.contentResolver.openOutputStream(uri)?.use { out ->
+                    File(d.path).inputStream().use { it.copyTo(out) }
+                } ?: error("the chosen location could not be opened")
+            }
+        }
+        noteSave(
+            outcome.fold(
+                // The name the picker actually gave it, so the message says where
+                // to look rather than where we asked for it to go.
+                onSuccess = { "Saved ${d.label.lowercase()} as ${displayName(uri) ?: d.suggestedName}" },
+                onFailure = { "Could not save the ${d.label.lowercase()}: ${it.message}" },
+            )
+        )
+    }
+
+    /** One save result, to the snackbar and to the panel the sheet is covering it with. */
+    private fun noteSave(text: String) {
+        _state.value = _state.value.copy(
+            message = text,
+            diagnostic = _state.value.diagnostic?.copy(saveNote = text),
+        )
+    }
+
+    /** The name the picked document ended up with; null when it cannot be read. */
+    private fun displayName(uri: Uri): String? = runCatching {
+        getApplication<Application>().contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+    }.getOrNull()
+
+    /**
+     * Hands the fetched diagnostic to whatever can send a file, through
+     * FileProvider — a power log is usually wanted by somebody else. An addition
+     * to saving it, not a replacement: a share sheet leaves nothing on the phone.
+     */
+    fun shareDiagnostic() {
+        val d = _state.value.diagnostic ?: return
+        val intent = books.shareDiagnosticIntent(File(d.path), d.mimeType, d.suggestedName)
+        if (intent == null) {
+            _state.value = _state.value.copy(message = "Could not share the ${d.label.lowercase()}")
+            return
+        }
+        runCatching { getApplication<Application>().startActivity(intent) }
+            .onFailure {
+                _state.value = _state.value.copy(
+                    message = "Nothing on this phone can send a file"
+                )
+            }
+    }
 
     /**
      * Stages a downloaded, signed image on the reader and reports what the reader
