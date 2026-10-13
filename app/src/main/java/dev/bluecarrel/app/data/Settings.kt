@@ -3,6 +3,7 @@ package dev.bluecarrel.app.data
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -598,6 +599,35 @@ class LastSyncStore(private val context: Context) {
 
     suspend fun save(summary: SyncSummary) {
         context.dataStore.edit { it[key] = summary.toJson() }
+    }
+}
+
+/**
+ * The app's own update check: when it last ran, and what it found.
+ *
+ * Both halves are kept so a launch can show the right badge before any request
+ * is made -- and so the once-a-day check survives the process being killed,
+ * which an in-memory timestamp would not. Only a check that ANSWERED stamps the
+ * time: a failed one must not buy itself a day of silence.
+ */
+class AppUpdateStore(private val context: Context) {
+
+    private object K {
+        val checkedAt = longPreferencesKey("app_update_checked_at")
+        val release = stringPreferencesKey("app_update_release")
+    }
+
+    /** The time of the last successful check (0 for never) and its result. */
+    suspend fun load(): Pair<Long, AppRelease?> {
+        val p = context.dataStore.data.first()
+        return (p[K.checkedAt] ?: 0L) to p[K.release]?.let(AppRelease::fromJson)
+    }
+
+    suspend fun save(checkedAt: Long, release: AppRelease) {
+        context.dataStore.edit { p ->
+            p[K.checkedAt] = checkedAt
+            p[K.release] = release.toJson()
+        }
     }
 }
 

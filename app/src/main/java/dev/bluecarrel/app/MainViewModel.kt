@@ -174,6 +174,24 @@ data class FirmwareProgress(
 )
 
 /**
+ * Where an update of THIS APP has got to. There is no verifying phase: the
+ * SHA-256 is computed as the bytes arrive, so the download ending IS the answer.
+ */
+enum class AppUpdatePhase { DOWNLOADING, READY }
+
+/**
+ * An app update in flight. [AppUpdatePhase.READY] means the APK is downloaded,
+ * its published SHA-256 matched, and Android's installer has it (or is waiting
+ * on "allow installs from this app"); nothing after that is this app's to report.
+ */
+data class AppUpdateProgress(
+    val version: String,
+    val phase: AppUpdatePhase,
+    val percent: Int = 0,
+    val kbps: Int = 0,
+)
+
+/**
  * "Link to Calibre book" for a book only on the reader: the reader's [filename],
  * the search box and what it found.
  */
@@ -383,6 +401,28 @@ data class UiState(
     val firmwareChecking: Boolean = false,
 
     /**
+     * The newest published build of THIS APP, as the last check saw it. Restored
+     * from DataStore at launch, so it is right before any request is made.
+     */
+    val latestApp: AppRelease? = null,
+    /**
+     * Why the app's own update check could not answer, when it could not. Shown
+     * instead of a verdict: "Up to date" after a failed check would be a guess.
+     */
+    val appCheckNote: String? = null,
+    /** A newer build of this app is published. Drives the overflow badge. */
+    val appUpdateAvailable: Boolean = false,
+    /** An app update check is running. */
+    val appChecking: Boolean = false,
+    /** This app's own download, until the installer has the file. */
+    val appUpdate: AppUpdateProgress? = null,
+    /**
+     * The APK is verified and the install is waiting on Android's "allow installs
+     * from this app". The Updates page opens that screen and resumes on the way back.
+     */
+    val appInstallBlocked: Boolean = false,
+
+    /**
      * A trusted-host secret exists in DataStore. Deliberately NOT derived from
      * [pairing]: a failed connection resets session state to UNPAIRED while the
      * secret is still on disk, and gating "Forget pairing" on session state made
@@ -441,6 +481,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val OWNER_SETTINGS = "settings"
         const val OWNER_CRASH = "crash"
         const val OWNER_POWER_LOG = "power_log"
+        const val OWNER_APP_UPDATE = "app_update"
 
         /** How much of a fetched diagnostic the panel shows, and how much of it is decoded to find it. */
         const val DIAG_TAIL_LINES = 20
@@ -487,6 +528,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val LIBRARY_ECHO_MS = 15_000L
         /** A connect re-checks the update page at most this often. */
         const val FIRMWARE_CHECK_MS = 10 * 60_000L
+        /**
+         * The app's own update check runs at most once a day, and the answer is
+         * cached across launches. GitHub allows about 60 unauthenticated requests
+         * an hour from one address, shared with everything else on the network --
+         * a check on every launch would be a way to spend them for nothing.
+         */
+        const val APP_CHECK_MS = 24 * 60 * 60_000L
         /** While connected, the update page is re-checked this often (network only). */
         const val FIRMWARE_POLL_MS = 10 * 60_000L
         /** Presence broadcasts start a connect attempt at most this often. */
@@ -531,6 +579,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val replaceOnSend = ReplaceOnSendStore(app)
     private val lastSyncStore = LastSyncStore(app)
     private val darkModeSent = DarkModeSentStore(app)
+    /** Declared with the other stores, above init: init reads the cached app-update check. */
+    private val appUpdates = AppUpdateStore(app)
+
+    // --- this app's own update ----------------------------------------------------
+    // Above `init` like everything else init touches: checkAppUpdateOnLaunch() runs
+    // from init and writes both of these. (1.0.9 crashed on launch because a
+    // property init reached was declared below it and was still null.)
+
+    /** When the app's own check last ANSWERED; 0 for never. Restored from [appUpdates]. */
+    private var lastAppCheckAt = 0L
+    /** The check or download in flight, so a second tap does not start a second one. */
+    private var appUpdateJob: Job? = null
 
     /** Completed by [answerResume]; awaited by the save that raised the prompt. */
     private var resumeAnswer: CompletableDeferred<Boolean>? = null
@@ -692,6 +752,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         store.attach(viewModelScope)
         superviseLink()
         pollFirmware()
+        checkAppUpdateOnLaunch()
 
         viewModelScope.launch {
             val identity = pairingStore.load()
@@ -923,6 +984,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val s = _state.value
         if (s.hasStoredPairing && !s.connected && !s.link.busy) connectReader()
         checkFirmware()
+        // The app's own update too, but still only once a day: a pull is about the
+        // books and the reader, and GitHub's hourly allowance is small enough that
+        // a habit of pulling would spend it.
+        if (System.currentTimeMillis() - lastAppCheckAt >= APP_CHECK_MS) checkAppUpdate(quiet = true)
         return refreshEverything()
     }
 
@@ -5194,6 +5259,320 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             message = "Reader updated to $running",
         )
         firmwareWatchJob?.cancel()
+    }
+
+    // --------------------------------------------------- this app's own update
+
+    /**
+     * The app's own update check at launch: the cached answer first, so the badge
+     * is right with no network at all, then one check a day.
+     *
+     * Quiet on purpose. No dialog, no snackbar -- it sets [UiState.appUpdateAvailable],
+     * which marks the overflow button and the Updates page, in exactly the way
+     * [UiState.firmwareUpdateAvailable] marks the reader pill and the Firmware page.
+     * A popup on launch for something that can wait is a popup you learn to dismiss.
+     */
+    private fun checkAppUpdateOnLaunch() = viewModelScope.launch {
+        val (at, cached) = runCatching { appUpdates.load() }.getOrDefault(0L to null)
+        lastAppCheckAt = at
+        if (cached != null) {
+            _state.value = _state.value.copy(
+                latestApp = cached,
+                appUpdateAvailable = isNewerApp(cached),
+            )
+        }
+        if (System.currentTimeMillis() - at >= APP_CHECK_MS) checkAppUpdate(quiet = true)
+    }
+
+    /**
+     * Asks GitHub what the newest published build of this app is.
+     *
+     * [quiet] is the launch check: a failure is recorded for the Updates page but
+     * not pushed at the user, who did not ask. An explicit check (opening the
+     * Updates page, pull to refresh) says what went wrong.
+     */
+    fun checkAppUpdate(quiet: Boolean = false): Job {
+        appUpdateJob?.let { if (it.isActive) return it }
+        val job = viewModelScope.launch {
+            _state.value = _state.value.copy(appChecking = true)
+            val found = runCatching { withContext(Dispatchers.IO) { fetchNewestRelease() } }
+            found.fold(
+                onSuccess = { r ->
+                    // Only a check that answered stamps the time, so a week offline
+                    // does not leave the next launch believing it checked today.
+                    lastAppCheckAt = System.currentTimeMillis()
+                    runCatching { appUpdates.save(lastAppCheckAt, r) }
+                    _state.value = _state.value.copy(
+                        latestApp = r,
+                        appUpdateAvailable = isNewerApp(r),
+                        appCheckNote = null,
+                        appChecking = false,
+                    )
+                },
+                onFailure = { e ->
+                    // The cached answer stands. A check that could not run says
+                    // nothing about what is published, so nothing here claims
+                    // "up to date" -- the page shows this note instead.
+                    val note = appCheckFailure(e)
+                    _state.value = _state.value.copy(
+                        appChecking = false,
+                        appCheckNote = note,
+                        message = if (quiet) _state.value.message else note,
+                    )
+                },
+            )
+        }
+        appUpdateJob = job
+        return job
+    }
+
+    /**
+     * [r] is a genuinely newer build than this one.
+     *
+     * Compared number by number ([AppVersion]), never as text: "1.0.9" sorts
+     * after "1.0.20" as a string, which would offer a downgrade. The version code
+     * is not part of a GitHub release, so the name is what decides; BuildConfig's
+     * code is shown beside it on the Updates page and bumps with every name.
+     */
+    private fun isNewerApp(r: AppRelease): Boolean {
+        val mine = AppVersion.parse(BuildConfig.VERSION_NAME) ?: return false
+        val theirs = AppVersion.parse(r.version) ?: return false
+        return theirs > mine
+    }
+
+    /** Why a check could not answer, in the words the user gets. Never a verdict. */
+    private fun appCheckFailure(e: Throwable): String = when (e) {
+        is RateLimited -> "Rate limited by GitHub, try later"
+        is HttpGuard.TooLarge -> "GitHub's answer was too large"
+        // The parse refusing the answer ("No published builds", "malformed version").
+        is IllegalArgumentException -> e.message ?: "GitHub's answer could not be read"
+        is org.json.JSONException -> "GitHub's answer could not be read"
+        is java.io.IOException -> "Could not reach GitHub"
+        else -> e.message ?: "Could not check for updates"
+    }
+
+    /** The newest release on the releases API. See [APP_RELEASES_API] on pre-releases. */
+    private fun fetchNewestRelease(): AppRelease =
+        http.newCall(
+            okhttp3.Request.Builder()
+                .url(APP_RELEASES_API)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .build()
+        ).execute().use { r ->
+            // 403 or 429 with the counter at zero is the hourly cap, not a refusal.
+            // Worth its own message: "could not reach GitHub" would send someone to
+            // check their network when the answer is to wait.
+            if ((r.code == 403 || r.code == 429) &&
+                (r.header("x-ratelimit-remaining") == "0" || r.header("retry-after") != null)
+            ) {
+                throw RateLimited()
+            }
+            if (!r.isSuccessful) throw java.io.IOException("GitHub answered HTTP ${r.code}")
+            AppRelease.newest(HttpGuard.string(r, HttpGuard.RELEASES_MAX, "GitHub releases"))
+        }
+
+    /**
+     * Downloads the newest build, proves it is the published one, and hands it to
+     * Android's installer. The Update button, and the way back from "allow
+     * installs from this app".
+     */
+    fun installLatestApp() {
+        appUpdateJob?.let { if (it.isActive) return }
+        appUpdateJob = viewModelScope.launch { runAppUpdate() }
+    }
+
+    /** Back from the system "allow installs" screen: carry on where this left off. */
+    fun resumeAppInstall() {
+        _state.value = _state.value.copy(appInstallBlocked = false)
+        installLatestApp()
+    }
+
+    private suspend fun runAppUpdate() {
+        val app = getApplication<Application>()
+        // Already downloaded and verified: only the installer is left. This is the
+        // path back from the "allow installs" screen, and from a dismissed prompt.
+        _state.value.appUpdate?.takeIf { it.phase == AppUpdatePhase.READY }?.let { ready ->
+            handToInstaller(ready.version, ApkInstall.stagedApk(app, ready.version))
+            return
+        }
+        _state.value = _state.value.copy(appUpdate = AppUpdateProgress("", AppUpdatePhase.DOWNLOADING))
+        // Re-read the releases list first: the cached answer can be a day old, and
+        // downloading from a stale asset URL is how you install yesterday's build.
+        val r = runCatching { withContext(Dispatchers.IO) { fetchNewestRelease() } }.getOrElse { e ->
+            val note = appCheckFailure(e)
+            _state.value = _state.value.copy(appUpdate = null, appCheckNote = note, message = note)
+            return
+        }
+        lastAppCheckAt = System.currentTimeMillis()
+        runCatching { appUpdates.save(lastAppCheckAt, r) }
+        _state.value = _state.value.copy(
+            latestApp = r,
+            appUpdateAvailable = isNewerApp(r),
+            appCheckNote = null,
+        )
+        if (!isNewerApp(r)) {
+            _state.value = _state.value.copy(
+                appUpdate = null,
+                message = "This phone already runs ${BuildConfig.VERSION_NAME}",
+            )
+            return
+        }
+        // The published digest BEFORE the download, so a release with no checksum
+        // costs nothing to find out about: nothing unverifiable is ever downloaded.
+        val expected = runCatching { withContext(Dispatchers.IO) { publishedDigest(r) } }.getOrElse { e ->
+            _state.value = _state.value.copy(
+                appUpdate = null,
+                message = "No checksum published for ${r.version}: ${e.message}",
+            )
+            return
+        }
+        val target = ApkInstall.stagedApk(app, r.version)
+        // Whatever an earlier attempt left behind. The one being fetched is written
+        // fresh, so it is cleared too.
+        ApkInstall.clearStaged(app)
+        val label = "Downloading Bluecarrel ${r.version}…"
+        showTransfer(TransferProgress(label, 0, r.sizeBytes, owner = OWNER_APP_UPDATE)) {
+            it.copy(appUpdate = AppUpdateProgress(r.version, AppUpdatePhase.DOWNLOADING))
+        }
+        val digest = runCatching { withContext(Dispatchers.IO) { downloadApk(r, target, label) } }
+        if (digest.isFailure) {
+            target.delete()
+            endTransfer(OWNER_APP_UPDATE) {
+                it.copy(
+                    appUpdate = null,
+                    message = "Could not download ${r.version}: ${digest.exceptionOrNull()?.message}",
+                )
+            }
+            return
+        }
+        if (!digest.getOrThrow().equals(expected, ignoreCase = true)) {
+            target.delete()
+            endTransfer(OWNER_APP_UPDATE) {
+                it.copy(
+                    appUpdate = null,
+                    message = "${r.version} does not match its published SHA-256. Nothing was installed.",
+                )
+            }
+            return
+        }
+        endTransfer(OWNER_APP_UPDATE) {
+            it.copy(appUpdate = AppUpdateProgress(r.version, AppUpdatePhase.READY))
+        }
+        handToInstaller(r.version, target)
+    }
+
+    /**
+     * The SHA-256 the release publishes for its APK: the SHA256SUMS asset, which
+     * is the file the release process generates, and the `SHA-256:` line in the
+     * notes when there is no asset (or it does not name this APK).
+     */
+    private fun publishedDigest(r: AppRelease): String {
+        r.sumsUrl?.let { url ->
+            val fromAsset = runCatching {
+                http.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
+                    requireHttpsResponse(resp)
+                    if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                    AppRelease.digestFromSums(
+                        HttpGuard.string(resp, HttpGuard.SUMS_MAX, "SHA256SUMS"),
+                        r.apkName,
+                    )
+                }
+            }.getOrNull()
+            if (fromAsset != null) return fromAsset
+        }
+        return r.notesSha256 ?: error("the release publishes none")
+    }
+
+    /**
+     * Streams the APK into app-private storage, returning its SHA-256 as hex.
+     *
+     * The same shape as the firmware download: capped by the published size and
+     * by [HttpGuard.APK_MAX], digested as it goes so nothing is read twice, and
+     * reported through the one transfer bar under [OWNER_APP_UPDATE].
+     */
+    private suspend fun downloadApk(r: AppRelease, target: File, label: String): String =
+        http.newCall(okhttp3.Request.Builder().url(r.apkUrl).build()).execute().use { resp ->
+            // The URL that answered, not just the one that was asked: GitHub
+            // redirects downloads to its object store.
+            requireHttpsResponse(resp)
+            if (!resp.isSuccessful) error("HTTP ${resp.code}")
+            val cap = minOf(r.sizeBytes, HttpGuard.APK_MAX)
+            HttpGuard.checkDeclared(resp, cap, "Update")
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            var total = 0L
+            val gate = ProgressGate()
+            val meter = RateMeter()
+            resp.body!!.byteStream().use { input ->
+                target.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        total += n
+                        if (total > cap) throw HttpGuard.TooLarge("Update")
+                        out.write(buf, 0, n)
+                        digest.update(buf, 0, n)
+                        val kbps = meter.kbps(total)
+                        if (gate.due(total, r.sizeBytes)) {
+                            val p = TransferProgress(label, total, r.sizeBytes, kbps, owner = OWNER_APP_UPDATE)
+                            withContext(Dispatchers.Main) {
+                                showTransfer(p) {
+                                    it.copy(
+                                        appUpdate = AppUpdateProgress(
+                                            r.version, AppUpdatePhase.DOWNLOADING, p.percent, kbps,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (total != r.sizeBytes) error("the download is $total bytes, not ${r.sizeBytes}")
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
+
+    /**
+     * Hands the verified APK to Android's own installer, which asks the user.
+     *
+     * The real protection is Android's, not this app's: the installer refuses an
+     * APK signed with a different key than the installed app, so a build from
+     * someone else cannot replace this one however it was obtained. The SHA-256
+     * checked above is for a corrupted or truncated download -- which the
+     * installer would otherwise refuse as "App not installed" with no reason given.
+     *
+     * Android 8+ (minSdk here is 29) also needs "install unknown apps" for this
+     * app. Checked rather than assumed: without it the installer opens on a dead
+     * end, so [UiState.appInstallBlocked] sends the user to the system screen and
+     * [resumeAppInstall] picks the install back up with the file already verified.
+     */
+    private fun handToInstaller(version: String, apk: File) {
+        val app = getApplication<Application>()
+        if (!ApkInstall.allowed(app)) {
+            _state.value = _state.value.copy(
+                appInstallBlocked = true,
+                appUpdate = AppUpdateProgress(version, AppUpdatePhase.READY),
+                message = "Allow installs from Bluecarrel, then tap Install",
+            )
+            return
+        }
+        val intent = ApkInstall.installIntent(app, apk)
+        if (intent == null) {
+            _state.value = _state.value.copy(
+                appUpdate = null,
+                message = "The downloaded update has gone. Tap Update again.",
+            )
+            return
+        }
+        val launched = runCatching { app.startActivity(intent) }.isSuccess
+        _state.value = _state.value.copy(
+            appInstallBlocked = false,
+            // Stays READY: the install is Android's now, and a declined prompt
+            // leaves a verified file the Install button can hand over again.
+            appUpdate = AppUpdateProgress(version, AppUpdatePhase.READY),
+            message = if (launched) _state.value.message else "Android would not open the installer",
+        )
     }
 
     // ------------------------------------------------------- reader settings

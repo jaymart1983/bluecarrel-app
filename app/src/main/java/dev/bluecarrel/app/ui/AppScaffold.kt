@@ -50,6 +50,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.bluecarrel.app.AppTab
+import dev.bluecarrel.app.AppUpdatePhase
+import dev.bluecarrel.app.AppUpdateProgress
 import dev.bluecarrel.app.FetchedDiagnostic
 import dev.bluecarrel.app.FirmwarePhase
 import dev.bluecarrel.app.FirmwareProgress
@@ -59,6 +61,7 @@ import dev.bluecarrel.app.ReaderScan
 import dev.bluecarrel.app.TransferProgress
 import dev.bluecarrel.app.transferRate
 import dev.bluecarrel.app.UiState
+import dev.bluecarrel.app.data.ApkInstall
 import dev.bluecarrel.app.data.BlePermissions
 import dev.bluecarrel.app.data.DiscoveredReader
 import dev.bluecarrel.app.data.Book
@@ -173,6 +176,32 @@ fun AppScaffold(vm: MainViewModel) {
                         IconButton(onClick = { overflowOpen = true }) {
                             Icon(Icons.Default.MoreVert, "More")
                         }
+                        // The app's own update badge, built exactly like the
+                        // firmware one on the reader pill: the sync glyph in a
+                        // primary circle, turning while bytes move and pulsing
+                        // while it waits to be installed. The two are the same
+                        // kind of news and should look it. Quiet by design --
+                        // nothing on launch pops up to say so.
+                        val appUpdate = state.appUpdate
+                        if (appUpdate != null || state.appUpdateAvailable) {
+                            Box(
+                                Modifier
+                                    .align(Alignment.TopEnd)
+                                    .size(16.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                SyncGlyph(
+                                    spinning = appUpdate?.phase == AppUpdatePhase.DOWNLOADING,
+                                    pulsing = appUpdate?.phase == AppUpdatePhase.READY,
+                                    tint = MaterialTheme.colorScheme.onPrimary,
+                                    sizeDp = 14,
+                                    contentDescription = appUpdate?.let { appUpdateLabel(it) }
+                                        ?: "App update available",
+                                )
+                            }
+                        }
                         DropdownMenu(
                             expanded = overflowOpen,
                             onDismissRequest = { overflowOpen = false },
@@ -189,8 +218,27 @@ fun AppScaffold(vm: MainViewModel) {
                             // Firmware belongs to the READER, so it lives in the pill
                             // with the reader's other controls, not with the app's.
                             for (sec in SettingsSection.entries.filter { it != SettingsSection.FIRMWARE }) {
+                                val appNews = sec == SettingsSection.UPDATES &&
+                                    (appUpdate != null || state.appUpdateAvailable)
                                 DropdownMenuItem(
-                                    text = { Text(sec.label) },
+                                    text = {
+                                        Text(
+                                            if (appNews) appUpdate?.let { appUpdateLabel(it) }
+                                                ?: "Update available"
+                                            else sec.label
+                                        )
+                                    },
+                                    leadingIcon = if (!appNews) null else {
+                                        {
+                                            SyncGlyph(
+                                                spinning = appUpdate?.phase == AppUpdatePhase.DOWNLOADING,
+                                                pulsing = appUpdate?.phase == AppUpdatePhase.READY,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                sizeDp = 24,
+                                                contentDescription = null,
+                                            )
+                                        }
+                                    },
                                     onClick = { overflowOpen = false; settingsSection = sec },
                                 )
                             }
@@ -336,6 +384,12 @@ fun AppScaffold(vm: MainViewModel) {
             onRefreshReaderPower = { vm.refreshReaderPower() },
             onCheckFirmware = { vm.checkFirmware() },
             onInstallFirmware = { vm.installLatestFirmware(); settingsSection = null },
+            // The sheet stays open: the download's progress, the version and the
+            // Install button are all in this panel, and the installer Android
+            // raises over it is dismissable back to here.
+            onCheckAppUpdate = { vm.checkAppUpdate() },
+            onInstallApp = { vm.installLatestApp() },
+            onResumeAppInstall = { vm.resumeAppInstall() },
         )
     }
 
@@ -764,6 +818,21 @@ private fun firmwareProgressLabel(p: FirmwareProgress): String {
         FirmwarePhase.INSTALLING -> "Sent to reader, waiting on install"
         FirmwarePhase.SCHEDULED -> "${p.version} installs when the reader sleeps"
     }
+}
+
+/**
+ * What the overflow badge, its menu item and the Updates page say about an app
+ * update in flight: "Downloading 1.0.21 · 45% · 1.2 MB/s", then "1.0.21 ready to
+ * install". The rate is left off until it is known. [firmwareProgressLabel]'s
+ * counterpart, so the two read alike.
+ */
+private fun appUpdateLabel(p: AppUpdateProgress): String = when (p.phase) {
+    AppUpdatePhase.DOWNLOADING -> buildString {
+        append("Downloading ").append(p.version.ifBlank { "update" })
+        append(" · ").append(p.percent).append('%')
+        if (p.kbps > 0) append(" · ").append(transferRate(p.kbps))
+    }
+    AppUpdatePhase.READY -> "${p.version} ready to install"
 }
 
 /** The sync glyph: turning while [spinning] (bytes moving), pulsing while [pulsing] (waiting). */
@@ -1727,6 +1796,10 @@ private fun SettingsSheet(
     onRefreshReaderPower: () -> Unit,
     onCheckFirmware: () -> Unit,
     onInstallFirmware: () -> Unit,
+    onCheckAppUpdate: () -> Unit,
+    onInstallApp: () -> Unit,
+    /** Back from Android's "allow installs from this app" screen. */
+    onResumeAppInstall: () -> Unit,
 ) {
     var c by remember { mutableStateOf(config) }
 
@@ -1793,11 +1866,62 @@ private fun SettingsSheet(
                 }
 
                 SettingsSection.UPDATES -> {
+                    // One check when the page opens, like the Firmware page. Not
+                    // subject to the once-a-day throttle: opening this page is
+                    // someone asking, and the answer they get should be today's.
+                    LaunchedEffect(Unit) { onCheckAppUpdate() }
+                    // Android 8+ needs "install unknown apps" for this app before the
+                    // installer will open. The system screen is the only place to
+                    // grant it, and the install carries on when the user comes back.
+                    val allowInstalls = rememberLauncherForActivityResult(
+                        ActivityResultContracts.StartActivityForResult()
+                    ) { onResumeAppInstall() }
+                    LaunchedEffect(state.appInstallBlocked) {
+                        if (state.appInstallBlocked) {
+                            runCatching { allowInstalls.launch(ApkInstall.unknownSourcesIntent(context)) }
+                        }
+                    }
+                    val appProgress = state.appUpdate
+                    val latestApp = state.latestApp
                     Text(
-                        "Installed: " + dev.bluecarrel.app.BuildConfig.VERSION_NAME +
-                            " (code " + dev.bluecarrel.app.BuildConfig.VERSION_CODE + ")",
+                        buildString {
+                            append("Installed: ").append(dev.bluecarrel.app.BuildConfig.VERSION_NAME)
+                            append(" (code ").append(dev.bluecarrel.app.BuildConfig.VERSION_CODE).append(")\n")
+                            // A failed check never reads as a verdict: the note says
+                            // what went wrong instead of claiming "Up to date".
+                            append(
+                                when {
+                                    appProgress != null -> appUpdateLabel(appProgress)
+                                    state.appChecking -> "Checking…"
+                                    state.appCheckNote != null -> state.appCheckNote
+                                    state.appUpdateAvailable && latestApp != null -> "${latestApp.version} available"
+                                    latestApp != null -> "Up to date"
+                                    else -> "Checking…"
+                                }
+                            )
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
+                    Button(
+                        onClick = onInstallApp,
+                        enabled = (state.appUpdateAvailable || appProgress?.phase == AppUpdatePhase.READY) &&
+                            appProgress?.phase != AppUpdatePhase.DOWNLOADING,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            when {
+                                appProgress?.phase == AppUpdatePhase.DOWNLOADING -> appUpdateLabel(appProgress)
+                                appProgress?.phase == AppUpdatePhase.READY -> "Install ${appProgress.version}"
+                                state.appUpdateAvailable && latestApp != null -> "Update to ${latestApp.version}"
+                                else -> "Update"
+                            }
+                        )
+                    }
+                    Text(
+                        "Android asks before installing.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    HorizontalDivider()
                     Field("Update page", c.updatesUrl, error = httpsError(c.updatesUrl)) { c = c.copy(updatesUrl = it) }
                     Text(
                         "Firmware update page (firmware.json). Blank uses GitHub releases.",

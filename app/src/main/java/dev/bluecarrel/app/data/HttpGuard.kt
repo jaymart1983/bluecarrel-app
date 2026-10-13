@@ -21,6 +21,13 @@ object HttpGuard {
     const val MANIFEST_MAX = 64L * 1024
     const val FIRMWARE_MAX = 8L * 1024 * 1024
 
+    // This app's own update. The APK is about 21 MB; the cap leaves room to grow
+    // without letting a wrong URL feed the phone a gigabyte. The releases list is
+    // asked for ten at a time, which is about 60 KB.
+    const val APK_MAX = 48L * 1024 * 1024
+    const val RELEASES_MAX = 512L * 1024
+    const val SUMS_MAX = 64L * 1024
+
     /** An absolute https:// URL that parses. */
     fun isHttps(url: String): Boolean {
         val v = url.trim()

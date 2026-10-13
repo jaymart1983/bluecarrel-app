@@ -5,4 +5,7 @@
     <!-- Diagnostics pulled off the reader (power log, crash report), shared out
          of the app so they can be sent to someone who can read them. -->
     <files-path name="diagnostics" path="diagnostics/" />
+    <!-- The downloaded APK handed to Android's installer. App-private storage, so
+         nothing else can rewrite it between the checksum and the install. -->
+    <files-path name="updates" path="updates/" />
 </paths>

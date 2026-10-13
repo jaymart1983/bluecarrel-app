@@ -48,6 +48,13 @@
          reader wakes while the app is closed. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- The app's own update. Android's installer is launched with the downloaded
+         APK and refuses to open without this permission. It is not a licence to
+         install anything: the user confirms the install, on 8+ they must first
+         allow installs from this app (Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES),
+         and Android rejects an APK signed with a different key than this one. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
